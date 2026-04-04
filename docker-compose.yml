@@ -1,0 +1,16 @@
+services:
+  fusionride:
+    build: .
+    container_name: fusionride
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+    volumes:
+      - fusionride-data:/app/data
+      - fusionride-config:/app/config
+    environment:
+      - TZ=Asia/Shanghai
+
+volumes:
+  fusionride-data:
+  fusionride-config:

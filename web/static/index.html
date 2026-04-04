@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FusionRide · 管理面板</title>
+    <meta name="description" content="FusionRide — Emby 聚合反代管理面板">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- 登录/设置界面 -->
+        <div id="auth-screen" class="screen">
+            <div class="auth-container">
+                <div class="auth-logo">
+                    <div class="logo-icon">⚡</div>
+                    <h1>FusionRide</h1>
+                    <p class="auth-subtitle">Emby 聚合反代管理面板</p>
+                </div>
+                <form id="auth-form" class="auth-form">
+                    <div class="form-group">
+                        <label for="auth-username">用户名</label>
+                        <input type="text" id="auth-username" placeholder="admin" autocomplete="username">
+                    </div>
+                    <div class="form-group">
+                        <label for="auth-password">密码</label>
+                        <input type="password" id="auth-password" placeholder="••••••••" autocomplete="current-password">
+                    </div>
+                    <button type="submit" id="auth-btn" class="btn btn-primary btn-full">
+                        <span id="auth-btn-text">登录</span>
+                    </button>
+                    <p id="auth-error" class="auth-error"></p>
+                </form>
+            </div>
+        </div>
+
+        <!-- 主界面 -->
+        <div id="main-screen" class="screen" style="display:none">
+            <!-- 侧边导航 -->
+            <nav id="sidebar" class="sidebar">
+                <div class="sidebar-header">
+                    <div class="logo-small">⚡</div>
+                    <span class="sidebar-title">FusionRide</span>
+                </div>
+                <ul class="nav-list">
+                    <li><a href="#/dashboard" class="nav-item active" data-page="dashboard">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+                        <span>仪表盘</span>
+                    </a></li>
+                    <li><a href="#/upstreams" class="nav-item" data-page="upstreams">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4M2 12h4m12 0h4m-2.93-7.07l-2.83 2.83m-8.48 8.48l-2.83 2.83m14.14 0l-2.83-2.83M6.34 6.34L3.51 3.51"/></svg>
+                        <span>上游管理</span>
+                    </a></li>
+                    <li><a href="#/traffic" class="nav-item" data-page="traffic">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                        <span>流量监控</span>
+                    </a></li>
+                    <li><a href="#/logs" class="nav-item" data-page="logs">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16c0 1.1.9 2 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                        <span>日志</span>
+                    </a></li>
+                    <li><a href="#/diagnostics" class="nav-item" data-page="diagnostics">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                        <span>诊断</span>
+                    </a></li>
+                    <li><a href="#/settings" class="nav-item" data-page="settings">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                        <span>设置</span>
+                    </a></li>
+                </ul>
+                <div class="sidebar-footer">
+                    <button id="logout-btn" class="btn btn-ghost btn-sm">退出登录</button>
+                </div>
+            </nav>
+
+            <!-- 内容区 -->
+            <main id="content" class="content">
+                <!-- 页面由 JS 动态渲染 -->
+            </main>
+        </div>
+    </div>
+
+    <!-- Toast 通知 -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- 模态框 -->
+    <div id="modal-overlay" class="modal-overlay" style="display:none">
+        <div id="modal-content" class="modal-content"></div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+fusionride
+fusionride-*
+
+# Database & Configs
+data/
+config/config.yaml
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+
+# Go files
+*.test
+*.out
+go.work
