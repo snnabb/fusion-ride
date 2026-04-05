@@ -147,15 +147,28 @@ func (h *Handler) handleStreamCompat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mode := selected.EffectivePlaybackMode(h.cfg.Playback.Mode)
+	streamQuery := r.URL.Query()
+	for _, param := range []string{"MediaSourceId", "mediaSourceId", "ItemId", "itemId"} {
+		if virtualQueryID := strings.TrimSpace(streamQuery.Get(param)); virtualQueryID != "" {
+			if originalQueryID, _, ok := h.ids.Resolve(virtualQueryID); ok {
+				streamQuery.Set(param, originalQueryID)
+			}
+		}
+	}
+	rawQuery := streamQuery.Encode()
 	switch mode {
 	case "direct":
-		streamURL := selected.BuildStreamURL(originalID, r.URL.RawQuery)
+		streamURL := selected.BuildStreamURL(originalID, rawQuery)
 		h.log.Debug("流媒体直连重定向: %s -> %s", virtualID, streamURL)
 		http.Redirect(w, r, streamURL, http.StatusFound)
 	case "redirect":
-		h.proxyStreamWithRedirectFollow(w, r, selected, originalID)
+		rewritten := r.Clone(r.Context())
+		rewritten.URL.RawQuery = rawQuery
+		h.proxyStreamWithRedirectFollow(w, rewritten, selected, originalID)
 	default:
-		h.proxyStreamCompat(w, r, selected, originalID)
+		rewritten := r.Clone(r.Context())
+		rewritten.URL.RawQuery = rawQuery
+		h.proxyStreamCompat(w, rewritten, selected, originalID)
 	}
 }
 

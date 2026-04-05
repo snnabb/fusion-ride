@@ -151,6 +151,7 @@ func (h *Handler) cleanupExpiredPlaybackSessions(now time.Time) int {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	routePath := normalizeRoutePath(path)
+	h.log.Debug("请求: %s %s [Client: %s, UA: %s]", r.Method, r.URL.String(), r.Header.Get("X-Emby-Client"), r.Header.Get("User-Agent"))
 
 	switch {
 	case isWebSocket(r):
@@ -194,6 +195,55 @@ func (h *Handler) handleUsersPublic(w http.ResponseWriter, _ *http.Request) {
 		"HasConfiguredPassword":     true,
 		"HasConfiguredEasyPassword": false,
 	}})
+}
+
+func (h *Handler) buildProxyUserResponse(proxyUserID string) map[string]any {
+	cfg := h.cfg.Snapshot()
+	now := time.Now().UTC().Format("2006-01-02T15:04:05.0000000Z")
+	return map[string]any{
+		"Name":                      cfg.Admin.Username,
+		"ServerId":                  cfg.Server.ID,
+		"Id":                        proxyUserID,
+		"HasPassword":               true,
+		"HasConfiguredPassword":     true,
+		"HasConfiguredEasyPassword": false,
+		"ConnectUserName":           "",
+		"ConnectLinkType":           "Guest",
+		"DateCreated":               "2024-01-01T00:00:00.0000000Z",
+		"LastLoginDate":             now,
+		"LastActivityDate":          now,
+		"Configuration": map[string]any{
+			"PlayDefaultAudioTrack":      true,
+			"SubtitleLanguagePreference": "",
+			"DisplayMissingEpisodes":     false,
+			"SubtitleMode":               "Default",
+			"EnableLocalPassword":        false,
+			"EnableNextEpisodeAutoPlay":  true,
+			"RememberAudioSelections":    true,
+			"RememberSubtitleSelections": true,
+		},
+		"Policy": map[string]any{
+			"IsAdministrator":                true,
+			"IsHidden":                       true,
+			"IsDisabled":                     false,
+			"EnableAllFolders":               true,
+			"EnableContentDeletion":          false,
+			"EnableRemoteAccess":             true,
+			"EnableLiveTvAccess":             true,
+			"EnableLiveTvManagement":         false,
+			"EnableMediaPlayback":            true,
+			"EnableAudioPlaybackTranscoding": true,
+			"EnableVideoPlaybackTranscoding": true,
+			"EnablePlaybackRemuxing":         true,
+			"EnableContentDownloading":       true,
+			"EnableSyncTranscoding":          true,
+			"EnableSubtitleManagement":       false,
+			"InvalidLoginAttemptCount":       0,
+			"EnableAllChannels":              true,
+			"EnableAllDevices":               true,
+			"EnableUserPreferenceAccess":     true,
+		},
+	}
 }
 
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -456,13 +506,36 @@ func (h *Handler) resolveUpstreamUserID(ctx context.Context, selected *upstream.
 func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimSpace(r.Header.Get("X-Emby-Token"))
 	if token == "" {
-		h.handleFallback(w, r)
+		token = strings.TrimSpace(r.URL.Query().Get("api_key"))
+	}
+	if token == "" {
+		http.Error(w, "缺少登录令牌", http.StatusUnauthorized)
 		return
 	}
 
 	session, ok := h.lookupSession(token)
 	if !ok {
-		h.handleFallback(w, r)
+		http.Error(w, "未找到登录会话", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.buildProxyUserResponse(session.ProxyUserID))
+}
+
+func (h *Handler) handleCurrentUserUpstreamLegacy(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.Header.Get("X-Emby-Token"))
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("api_key"))
+	}
+	if token == "" {
+		http.Error(w, "缺少登录令牌", http.StatusUnauthorized)
+		return
+	}
+
+	session, ok := h.lookupSession(token)
+	if !ok {
+		http.Error(w, "未找到登录会话", http.StatusUnauthorized)
 		return
 	}
 
@@ -510,6 +583,13 @@ func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleProxyUserRequest(w http.ResponseWriter, r *http.Request) {
+	cleanPath := normalizeRoutePath(r.URL.Path)
+	parts := strings.Split(strings.Trim(cleanPath, "/"), "/")
+	if len(parts) == 2 && parts[0] == "Users" && parts[1] == h.proxyUserID {
+		h.handleCurrentUser(w, r)
+		return
+	}
+
 	token := strings.TrimSpace(r.Header.Get("X-Emby-Token"))
 	if token == "" {
 		http.Error(w, "缺少登录令牌", http.StatusUnauthorized)

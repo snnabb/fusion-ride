@@ -199,7 +199,7 @@ func TestHandleLoginReturnsStableProxyUserID(t *testing.T) {
 	}
 }
 
-func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
+func TestUsersMeReturnsProxyIdentity(t *testing.T) {
 	var paths []string
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
@@ -273,19 +273,68 @@ func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d with body %s", rec.Code, rec.Body.String())
 	}
-	if strings.Join(paths, ",") != "/Users/upstream-user" {
-		t.Fatalf("expected direct /Users/{id} fetch, got %q", strings.Join(paths, ","))
+	if len(paths) != 0 {
+		t.Fatalf("expected /Users/Me not to hit upstream, got %q", strings.Join(paths, ","))
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("unmarshal /Users/Me response failed: %v", err)
 	}
+	if payload["Name"] != "proxy-admin" {
+		t.Fatalf("expected /Users/Me to return proxy admin name, got %#v", payload["Name"])
+	}
 	if payload["Id"] != handler.proxyUserID {
 		t.Fatalf("expected /Users/Me to return proxy user id %q, got %q", handler.proxyUserID, payload["Id"])
 	}
 	if payload["ServerId"] != "fusionride" {
 		t.Fatalf("expected server id to be rewritten, got %q", payload["ServerId"])
+	}
+	policy, ok := payload["Policy"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected policy payload, got %#v", payload["Policy"])
+	}
+	if policy["IsAdministrator"] != true {
+		t.Fatalf("expected proxy admin policy, got %#v", policy["IsAdministrator"])
+	}
+}
+
+func TestProxyUserRootPathReturnsProxyIdentity(t *testing.T) {
+	database := openProxyTestDB(t)
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	cfg.Server.ID = "fusionride"
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
+
+	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	handler.rememberSession("client-token", loginSession{
+		UpstreamID:     1,
+		UpstreamUserID: "upstream-user",
+		ProxyUserID:    handler.proxyUserID,
+		lastAccess:     time.Now(),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/Users/"+handler.proxyUserID, nil)
+	req.Header.Set("X-Emby-Token", "client-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d with body %s", rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal proxy user response failed: %v", err)
+	}
+	if payload["Name"] != "proxy-admin" {
+		t.Fatalf("expected proxy identity name, got %#v", payload["Name"])
+	}
+	if payload["Id"] != handler.proxyUserID {
+		t.Fatalf("expected proxy identity id %q, got %#v", handler.proxyUserID, payload["Id"])
 	}
 }
 func TestHandleSystemInfoPublicReturnsCompatiblePayload(t *testing.T) {
@@ -801,10 +850,10 @@ func TestHandleImageCachesSmallResponses(t *testing.T) {
 	}
 }
 
-func TestHandleCurrentUserDoesNotForwardProxyTokenToUpstream(t *testing.T) {
-	var capturedToken string
+func TestHandleCurrentUserReturnsProxyIdentityWithoutForwarding(t *testing.T) {
+	var requests int
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedToken = r.Header.Get("X-Emby-Token")
+		requests++
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"Id":       "upstream-user",
@@ -845,8 +894,23 @@ func TestHandleCurrentUserDoesNotForwardProxyTokenToUpstream(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected current user request to succeed, got %d with body %s", rec.Code, rec.Body.String())
 	}
-	if capturedToken != "upstream-session-token" {
-		t.Fatalf("expected upstream session token, got %q", capturedToken)
+	if requests != 0 {
+		t.Fatalf("expected current user request not to hit upstream, got %d requests", requests)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal current user response failed: %v", err)
+	}
+	if payload["Name"] != "proxy-admin" {
+		t.Fatalf("expected proxy admin name, got %#v", payload["Name"])
+	}
+	policy, ok := payload["Policy"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected proxy policy payload, got %#v", payload["Policy"])
+	}
+	if policy["IsAdministrator"] != true {
+		t.Fatalf("expected proxy admin policy, got %#v", policy["IsAdministrator"])
 	}
 }
 
@@ -1083,7 +1147,8 @@ func TestHandleStreamDirectModeRedirectsToStreamingURL(t *testing.T) {
 	upstreamInstance.Mu.Unlock()
 
 	virtualID := store.GetOrCreate("item-original", 2, "Movie")
-	req := httptest.NewRequest(http.MethodGet, "/emby/Videos/"+virtualID+"/stream?Static=true", nil)
+	virtualMediaSourceID := store.GetOrCreate("media-original", 2, "MediaSource")
+	req := httptest.NewRequest(http.MethodGet, "/emby/Videos/"+virtualID+"/stream?Static=true&MediaSourceId="+virtualMediaSourceID, nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -1091,10 +1156,16 @@ func TestHandleStreamDirectModeRedirectsToStreamingURL(t *testing.T) {
 		t.Fatalf("expected direct playback mode to redirect, got %d with body %s", rec.Code, rec.Body.String())
 	}
 	location := rec.Header().Get("Location")
-	if !strings.HasPrefix(location, "https://stream.example.com/Videos/item-original/stream?Static=true") {
+	if !strings.HasPrefix(location, "https://stream.example.com/Videos/item-original/stream?") {
 		t.Fatalf("expected redirect to streaming_url, got %q", location)
 	}
 	if !strings.Contains(location, "api_key=token") {
 		t.Fatalf("expected redirect url to include upstream session token, got %q", location)
+	}
+	if !strings.Contains(location, "MediaSourceId=media-original") {
+		t.Fatalf("expected redirect url to devirtualize MediaSourceId, got %q", location)
+	}
+	if strings.Contains(location, virtualMediaSourceID) {
+		t.Fatalf("expected redirect url not to leak virtual MediaSourceId %q, got %q", virtualMediaSourceID, location)
 	}
 }
