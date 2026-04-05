@@ -58,7 +58,7 @@ func (s *Server) Start(ctx context.Context) error {
 		time.Duration(s.cfg.Timeouts.Aggregate)*time.Millisecond,
 		s.cfg.Bitrate.CodecPriority,
 	)
-	proxyHandler := proxy.NewHandler(s.cfg, s.upMgr, agg, ids, s.log, s.meter)
+	proxyHandler := proxy.NewHandler(s.cfg, s.db, s.upMgr, agg, ids, s.log, s.meter)
 	proxyHandler.StartSessionCleanup(ctx)
 
 	s.adminAPI = admin.NewAPI(s.cfg, s.cfgPath, adminAuth, s.upMgr, ids, s.log, s.meter)

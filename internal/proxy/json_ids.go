@@ -42,6 +42,9 @@ func (h *Handler) virtualizeJSONBytes(data []byte, serverID int) []byte {
 		if value == "" {
 			return "", false
 		}
+		if value == h.proxyUserID {
+			return value, true
+		}
 		return h.ids.GetOrCreate(value, serverID, ""), true
 	})
 
@@ -61,6 +64,25 @@ func (h *Handler) devirtualizeJSONBytes(data []byte, upstreamID int) []byte {
 	walkJSONIDs(parsed, "", func(value string) (string, bool) {
 		return h.originalIDForUpstream(value, upstreamID)
 	})
+
+	result, err := json.Marshal(parsed)
+	if err != nil {
+		return data
+	}
+	return result
+}
+
+func (h *Handler) rewriteProxyUserIdentityJSON(data []byte, fromID, toID, serverID string) []byte {
+	if len(data) == 0 || fromID == "" || toID == "" {
+		return data
+	}
+
+	var parsed any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return data
+	}
+
+	walkProxyUserIdentity(parsed, fromID, toID, serverID)
 
 	result, err := json.Marshal(parsed)
 	if err != nil {
@@ -106,6 +128,30 @@ func walkJSONIDs(data any, parentKey string, rewrite func(value string) (string,
 	}
 }
 
+func walkProxyUserIdentity(data any, fromID, toID, serverID string) {
+	switch v := data.(type) {
+	case map[string]any:
+		for key, value := range v {
+			switch typed := value.(type) {
+			case string:
+				if shouldRewriteUserKey(key) && typed == fromID {
+					v[key] = toID
+					continue
+				}
+				if key == "ServerId" && serverID != "" {
+					v[key] = serverID
+					continue
+				}
+			}
+			walkProxyUserIdentity(value, fromID, toID, serverID)
+		}
+	case []any:
+		for _, value := range v {
+			walkProxyUserIdentity(value, fromID, toID, serverID)
+		}
+	}
+}
+
 func shouldRewriteScalarKey(key string) bool {
 	if _, ok := idFieldNames[key]; ok {
 		return true
@@ -118,4 +164,8 @@ func shouldRewriteArrayKey(key string) bool {
 		return true
 	}
 	return strings.HasSuffix(key, "Ids")
+}
+
+func shouldRewriteUserKey(key string) bool {
+	return key == "Id" || key == "UserId" || strings.HasSuffix(key, "UserId")
 }

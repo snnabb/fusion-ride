@@ -15,6 +15,7 @@ import (
 
 	"github.com/snnabb/fusion-ride/internal/aggregator"
 	"github.com/snnabb/fusion-ride/internal/config"
+	"github.com/snnabb/fusion-ride/internal/db"
 	"github.com/snnabb/fusion-ride/internal/idmap"
 	"github.com/snnabb/fusion-ride/internal/logger"
 	"github.com/snnabb/fusion-ride/internal/traffic"
@@ -28,6 +29,8 @@ type Handler struct {
 	ids   *idmap.Store
 	log   *logger.Logger
 	meter *traffic.Meter
+
+	proxyUserID string
 
 	sessionMu              sync.RWMutex
 	sessions               map[string]loginSession
@@ -44,7 +47,7 @@ type Handler struct {
 type loginSession struct {
 	UpstreamID     int
 	UpstreamUserID string
-	VirtualUserID  string
+	ProxyUserID    string
 	lastAccess     time.Time
 }
 
@@ -55,7 +58,7 @@ type playbackSession struct {
 	lastAccess     time.Time
 }
 
-func NewHandler(cfg *config.Config, upMgr *upstream.Manager, agg *aggregator.Aggregator, ids *idmap.Store, log *logger.Logger, meter *traffic.Meter) *Handler {
+func NewHandler(cfg *config.Config, database *db.DB, upMgr *upstream.Manager, agg *aggregator.Aggregator, ids *idmap.Store, log *logger.Logger, meter *traffic.Meter) *Handler {
 	return &Handler{
 		cfg:                    cfg,
 		upMgr:                  upMgr,
@@ -63,6 +66,7 @@ func NewHandler(cfg *config.Config, upMgr *upstream.Manager, agg *aggregator.Agg
 		ids:                    ids,
 		log:                    log,
 		meter:                  meter,
+		proxyUserID:            loadOrCreateProxyUserID(database),
 		sessions:               make(map[string]loginSession),
 		sessionMaxAge:          24 * time.Hour,
 		sessionCleanupInterval: 10 * time.Minute,
@@ -141,12 +145,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleWebSocket(w, r)
 	case strings.HasSuffix(path, "/AuthenticateByName"):
 		h.handleLogin(w, r)
+	case path == "/Users/Public" || path == "/emby/Users/Public":
+		h.handleUsersPublic(w, r)
 	case path == "/System/Info/Public" || path == "/emby/System/Info/Public":
 		h.handleSystemInfo(w, r)
 	case path == "/System/Info" || path == "/emby/System/Info":
 		h.handleSystemInfoAuth(w, r)
 	case path == "/Users/Me" || path == "/emby/Users/Me":
 		h.handleCurrentUser(w, r)
+	case h.isProxyUserPath(path):
+		h.handleProxyUserRequest(w, r)
 	case isPlaybackInfoPath(path):
 		h.handlePlaybackInfo(w, r)
 	case isPlaybackReportPath(path):
@@ -162,6 +170,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		h.handleFallback(w, r)
 	}
+}
+
+func (h *Handler) handleUsersPublic(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode([]map[string]any{{
+		"Name":                      h.cfg.Admin.Username,
+		"ServerId":                  h.cfg.Server.ID,
+		"Id":                        h.proxyUserID,
+		"HasPassword":               true,
+		"HasConfiguredPassword":     true,
+		"HasConfiguredEasyPassword": false,
+	}})
 }
 
 func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -234,22 +254,21 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var result map[string]any
 	_ = json.Unmarshal(respBody, &result)
 	var upstreamUserID string
-	var virtualUserID string
 	if _, ok := result["ServerId"].(string); ok {
 		result["ServerId"] = h.cfg.Server.ID
 	}
 	if user, ok := result["User"].(map[string]any); ok {
 		if userID, ok := user["Id"].(string); ok && userID != "" {
 			upstreamUserID = userID
-			virtualUserID = h.ids.GetOrCreate(userID, selected.ID, "User")
-			user["Id"] = virtualUserID
 		}
+		user["Id"] = h.proxyUserID
+		user["ServerId"] = h.cfg.Server.ID
 	}
-	if accessToken, ok := result["AccessToken"].(string); ok && accessToken != "" && upstreamUserID != "" && virtualUserID != "" {
+	if accessToken, ok := result["AccessToken"].(string); ok && accessToken != "" && upstreamUserID != "" {
 		h.rememberSession(accessToken, loginSession{
 			UpstreamID:     selected.ID,
 			UpstreamUserID: upstreamUserID,
-			VirtualUserID:  virtualUserID,
+			ProxyUserID:    h.proxyUserID,
 		})
 	}
 
@@ -301,16 +320,7 @@ func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusOK && len(body) > 0 {
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err == nil {
-			payload["Id"] = session.VirtualUserID
-			if _, ok := payload["ServerId"].(string); ok {
-				payload["ServerId"] = h.cfg.Server.ID
-			}
-			if rewritten, err := json.Marshal(payload); err == nil {
-				body = rewritten
-			}
-		}
+		body = h.rewriteProxyUserIdentityJSON(body, session.UpstreamUserID, session.ProxyUserID, h.cfg.Server.ID)
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -321,113 +331,122 @@ func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-func (h *Handler) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
-	info, ok := h.fetchSystemInfo(r.Context(), "/System/Info/Public", nil, false)
-	if !ok {
-		info = map[string]any{
-			"StartupWizardCompleted": true,
-			"Version":                "4.8.0.0",
-			"OperatingSystem":        "Linux",
-			"ProductName":            "Emby Server",
-		}
+func (h *Handler) handleProxyUserRequest(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(r.Header.Get("X-Emby-Token"))
+	if token == "" {
+		http.Error(w, "缺少登录令牌", http.StatusUnauthorized)
+		return
 	}
 
-	h.writeSystemInfo(w, info)
+	session, ok := h.lookupSession(token)
+	if !ok {
+		http.Error(w, "未找到登录会话", http.StatusUnauthorized)
+		return
+	}
+
+	selected := h.upMgr.ByID(session.UpstreamID)
+	if selected == nil {
+		http.Error(w, "上游服务不可用", http.StatusServiceUnavailable)
+		return
+	}
+
+	requestBody, err := readRequestBody(r)
+	if err != nil {
+		http.Error(w, "读取请求失败", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := h.withTimeout(r.Context(), h.cfg.Timeouts.API)
+	defer cancel()
+
+	upstreamPath := h.rewriteProxyUserPath(r.URL.Path, r.URL.RawQuery, session.UpstreamUserID, selected.ID)
+	requestBody = h.rewriteProxyUserIdentityJSON(requestBody, session.ProxyUserID, session.UpstreamUserID, "")
+	requestBody = h.devirtualizeRequestBody(requestBody, selected.ID)
+
+	resp, err := selected.DoAPIWithHeaders(ctx, r.Method, upstreamPath, readerFromBytes(requestBody), r.Header)
+	if err != nil {
+		http.Error(w, "代理用户请求失败", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "读取上游响应失败", http.StatusBadGateway)
+		return
+	}
+
+	if isJSONContentType(resp.Header) {
+		responseBody = h.rewriteProxyUserIdentityJSON(responseBody, session.UpstreamUserID, session.ProxyUserID, h.cfg.Server.ID)
+		responseBody = h.virtualizeJSONBytes(responseBody, selected.ID)
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header)
+	if isJSONContentType(resp.Header) {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(responseBody)
+}
+
+func (h *Handler) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.buildSystemInfoPayload(r, false))
 }
 
 func (h *Handler) handleSystemInfoAuth(w http.ResponseWriter, r *http.Request) {
-	info, ok := h.fetchSystemInfo(r.Context(), "/System/Info", r.Header, true)
-	if !ok {
-		info = map[string]any{
-			"StartupWizardCompleted": true,
-			"Version":                "4.8.0.0",
-			"OperatingSystem":        "Linux",
-			"ProductName":            "Emby Server",
-		}
+	token := strings.TrimSpace(r.Header.Get("X-Emby-Token"))
+	if token == "" {
+		http.Error(w, "缺少登录令牌", http.StatusUnauthorized)
+		return
 	}
-
-	h.writeSystemInfo(w, info)
-}
-
-func (h *Handler) fetchSystemInfo(parent context.Context, path string, incoming http.Header, authenticated bool) (map[string]any, bool) {
-	for _, candidate := range h.systemInfoCandidates(incoming) {
-		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-
-		var (
-			resp *http.Response
-			err  error
-		)
-		if authenticated {
-			resp, err = candidate.DoAPIWithHeaders(ctx, http.MethodGet, path, nil, incoming)
-		} else {
-			resp, err = candidate.DoAPI(ctx, http.MethodGet, path, nil)
-		}
-		cancel()
-		if err != nil {
-			continue
-		}
-
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil || resp.StatusCode != http.StatusOK {
-			continue
-		}
-
-		var info map[string]any
-		if json.Unmarshal(body, &info) == nil {
-			return info, true
-		}
+	if _, ok := h.lookupSession(token); !ok {
+		http.Error(w, "未找到登录会话", http.StatusUnauthorized)
+		return
 	}
-
-	return nil, false
-}
-
-func (h *Handler) systemInfoCandidates(incoming http.Header) []*upstream.Upstream {
-	onlineUpstreams := h.upMgr.Online()
-	if len(onlineUpstreams) == 0 {
-		return nil
-	}
-
-	var candidates []*upstream.Upstream
-	seen := make(map[int]struct{}, len(onlineUpstreams))
-	if incoming != nil {
-		if token := strings.TrimSpace(incoming.Get("X-Emby-Token")); token != "" {
-			if session, ok := h.lookupSession(token); ok {
-				if preferred := h.upMgr.ByID(session.UpstreamID); preferred != nil {
-					candidates = append(candidates, preferred)
-					seen[preferred.ID] = struct{}{}
-				}
-			}
-		}
-	}
-
-	for _, candidate := range onlineUpstreams {
-		if _, ok := seen[candidate.ID]; ok {
-			continue
-		}
-		candidates = append(candidates, candidate)
-	}
-
-	return candidates
-}
-
-func (h *Handler) writeSystemInfo(w http.ResponseWriter, info map[string]any) {
-	if info == nil {
-		info = make(map[string]any)
-	}
-
-	info["StartupWizardCompleted"] = true
-	info["ServerName"] = h.cfg.Server.Name
-	info["Id"] = h.cfg.Server.ID
-	delete(info, "LocalAddress")
-	delete(info, "LocalAddresses")
-	delete(info, "RemoteAddress")
-	delete(info, "RemoteAddresses")
-	delete(info, "WanAddress")
-	delete(info, "WanAddresses")
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(info)
+	_ = json.NewEncoder(w).Encode(h.buildSystemInfoPayload(r, true))
+}
+
+func (h *Handler) buildSystemInfoPayload(r *http.Request, authenticated bool) map[string]any {
+	address := fmt.Sprintf("http://%s", r.Host)
+	info := map[string]any{
+		"LocalAddress":                         address,
+		"ServerName":                           h.cfg.Server.Name,
+		"Version":                              "4.8.0.0",
+		"ProductName":                          "Emby Server",
+		"Id":                                   h.cfg.Server.ID,
+		"StartupWizardCompleted":               true,
+		"OperatingSystem":                      "Linux",
+		"CanSelfRestart":                       false,
+		"CanLaunchWebBrowser":                  false,
+		"HasUpdateAvailable":                   false,
+		"SupportsAutoRunAtStartup":             false,
+		"HardwareAccelerationRequiresPremiere": false,
+		"SupportsLibraryMonitor":               true,
+	}
+
+	if authenticated {
+		info["WanAddress"] = address
+		info["OperatingSystemDisplayName"] = "Linux"
+		info["CompletedInstallationWizard"] = true
+		info["CompletedInstallations"] = []any{}
+		info["CanSelfUpdate"] = false
+		info["HasPendingRestart"] = false
+		info["IsShuttingDown"] = false
+		info["IsInMaintenanceMode"] = false
+		info["HttpServerPortNumber"] = h.cfg.Server.Port
+		info["HttpsPortNumber"] = 8920
+		info["WebSocketPortNumber"] = h.cfg.Server.Port
+		info["SupportsHttps"] = false
+		info["SupportsLocalPortConfiguration"] = true
+		info["SupportsWakeServer"] = false
+		info["SystemUpdateLevel"] = "Release"
+		info["WakeOnLanInfo"] = []any{}
+	}
+
+	return info
 }
 
 func (h *Handler) handleAggregate(w http.ResponseWriter, r *http.Request) {
@@ -967,6 +986,29 @@ func (h *Handler) selectUpstreamForFallback(r *http.Request, body []byte) *upstr
 	return onlineUpstreams[0]
 }
 
+func (h *Handler) rewriteProxyUserPath(path string, rawQuery string, upstreamUserID string, upstreamID int) string {
+	parsed := &url.URL{Path: path, RawQuery: rawQuery}
+	segments := strings.Split(parsed.Path, "/")
+
+	if len(segments) > 2 && segments[1] == "emby" && len(segments) > 3 && segments[2] == "Users" && segments[3] == h.proxyUserID {
+		segments[3] = upstreamUserID
+	} else if len(segments) > 2 && segments[1] == "Users" && segments[2] == h.proxyUserID {
+		segments[2] = upstreamUserID
+	}
+
+	for i, segment := range segments {
+		if segment == h.proxyUserID || !isLikelyVirtualID(segment) {
+			continue
+		}
+		if originalID, ok := h.originalIDForUpstream(segment, upstreamID); ok {
+			segments[i] = originalID
+		}
+	}
+
+	parsed.Path = strings.Join(segments, "/")
+	return parsed.RequestURI()
+}
+
 func (h *Handler) rewritePathForUpstream(path string, rawQuery string, selected *upstream.Upstream) string {
 	parsed := &url.URL{Path: path, RawQuery: rawQuery}
 	segments := strings.Split(parsed.Path, "/")
@@ -1210,6 +1252,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (h *Handler) isProxyUserPath(path string) bool {
+	cleanPath := strings.TrimPrefix(path, "/emby")
+	parts := strings.Split(strings.Trim(cleanPath, "/"), "/")
+	if len(parts) < 2 || parts[0] != "Users" {
+		return false
+	}
+	return parts[1] == h.proxyUserID
 }
 
 func isLikelyVirtualID(value string) bool {
