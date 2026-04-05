@@ -420,7 +420,11 @@ func (h *Handler) writeSystemInfo(w http.ResponseWriter, info map[string]any) {
 	info["ServerName"] = h.cfg.Server.Name
 	info["Id"] = h.cfg.Server.ID
 	delete(info, "LocalAddress")
+	delete(info, "LocalAddresses")
+	delete(info, "RemoteAddress")
+	delete(info, "RemoteAddresses")
 	delete(info, "WanAddress")
+	delete(info, "WanAddresses")
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)

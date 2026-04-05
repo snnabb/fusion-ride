@@ -226,6 +226,8 @@ func TestHandleSystemInfoPublicProxiesUpstreamAndOverlaysFusionRideIdentity(t *t
 			"StartupWizardCompleted": true,
 			"OperatingSystem":        "Linux",
 			"LocalAddress":           "http://10.0.0.2:8096",
+			"LocalAddresses":         []string{"http://10.0.0.2:8096"},
+			"RemoteAddresses":        []string{"http://203.0.113.10:8096"},
 			"WanAddress":             "http://203.0.113.10:8096",
 			"WebSocketPortNumber":    8096,
 		})
@@ -273,6 +275,12 @@ func TestHandleSystemInfoPublicProxiesUpstreamAndOverlaysFusionRideIdentity(t *t
 	if _, ok := payload["LocalAddress"]; ok {
 		t.Fatal("expected LocalAddress to be removed")
 	}
+	if _, ok := payload["LocalAddresses"]; ok {
+		t.Fatal("expected LocalAddresses to be removed")
+	}
+	if _, ok := payload["RemoteAddresses"]; ok {
+		t.Fatal("expected RemoteAddresses to be removed")
+	}
 	if _, ok := payload["WanAddress"]; ok {
 		t.Fatal("expected WanAddress to be removed")
 	}
@@ -302,6 +310,8 @@ func TestHandleSystemInfoAuthUsesClientTokenAndOverlaysIdentity(t *testing.T) {
 			"ProductName":            "Emby Server",
 			"StartupWizardCompleted": true,
 			"OperatingSystem":        "Linux",
+			"LocalAddresses":         []string{"http://10.0.0.2:8096"},
+			"RemoteAddresses":        []string{"http://203.0.113.10:8096"},
 		})
 	}))
 	defer upstreamServer.Close()
@@ -356,6 +366,12 @@ func TestHandleSystemInfoAuthUsesClientTokenAndOverlaysIdentity(t *testing.T) {
 	}
 	if payload["ProductName"] != "Emby Server" {
 		t.Fatalf("expected ProductName to remain Emby Server, got %#v", payload["ProductName"])
+	}
+	if _, ok := payload["LocalAddresses"]; ok {
+		t.Fatal("expected LocalAddresses to be removed")
+	}
+	if _, ok := payload["RemoteAddresses"]; ok {
+		t.Fatal("expected RemoteAddresses to be removed")
 	}
 }
 
