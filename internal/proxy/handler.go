@@ -468,6 +468,15 @@ func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := h.withTimeout(r.Context(), h.cfg.Timeouts.API)
 	defer cancel()
 
+	if session.UpstreamUserID == "" {
+		session.UpstreamUserID = h.resolveUpstreamUserID(ctx, selected)
+		if session.UpstreamUserID == "" {
+			http.Error(w, "无法解析上游用户标识", http.StatusBadGateway)
+			return
+		}
+		h.rememberSession(token, session)
+	}
+
 	upstreamPath := "/Users/" + session.UpstreamUserID
 	if r.URL.RawQuery != "" {
 		upstreamPath += "?" + r.URL.RawQuery
@@ -520,6 +529,15 @@ func (h *Handler) handleProxyUserRequest(w http.ResponseWriter, r *http.Request)
 
 	ctx, cancel := h.withTimeout(r.Context(), h.cfg.Timeouts.API)
 	defer cancel()
+
+	if session.UpstreamUserID == "" {
+		session.UpstreamUserID = h.resolveUpstreamUserID(ctx, selected)
+		if session.UpstreamUserID == "" {
+			http.Error(w, "无法解析上游用户标识", http.StatusBadGateway)
+			return
+		}
+		h.rememberSession(token, session)
+	}
 
 	upstreamPath := h.rewriteProxyUserPath(r.URL.Path, r.URL.RawQuery, session.UpstreamUserID, selected.ID)
 	requestBody = h.rewriteProxyUserIdentityJSON(requestBody, session.ProxyUserID, session.UpstreamUserID, "")
