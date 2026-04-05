@@ -322,6 +322,10 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 	enabled := u.Enabled
 	u.Mu.Unlock()
 
+	if shouldReconnect {
+		_, _ = m.db.Exec(`UPDATE upstreams SET session_token = '', session_user_id = '' WHERE id = ?`, id)
+	}
+
 	if shouldReconnect && enabled {
 		go m.authenticate(u)
 	}
@@ -403,7 +407,7 @@ func (m *Manager) loadFromDB() {
 		`SELECT id, name, url, username, password, api_key, playback_mode, streaming_url,
 		        stream_hosts, spoof_mode, custom_ua, custom_client, custom_version, custom_device,
 		        custom_device_id, proxy_id, priority, priority_meta, follow_redirects,
-		        enabled, health_status, session_token
+		        enabled, health_status, session_token, session_user_id
 		 FROM upstreams ORDER BY priority ASC`,
 	)
 	if err != nil {
@@ -418,6 +422,7 @@ func (m *Manager) loadFromDB() {
 			streamHostsJSON                                     string
 			customUA, customClient, customVersion, customDevice string
 			customDeviceID, proxyID, sessionToken               string
+			sessionUserID                                       string
 			followRedirects                                     bool
 		)
 
@@ -426,7 +431,7 @@ func (m *Manager) loadFromDB() {
 			&u.PlaybackMode, &u.StreamingURL, &streamHostsJSON, &u.SpoofMode,
 			&customUA, &customClient, &customVersion, &customDevice, &customDeviceID,
 			&proxyID, &u.Priority, &u.PriorityMeta, &followRedirects,
-			&u.Enabled, &u.HealthStatus, &sessionToken,
+			&u.Enabled, &u.HealthStatus, &sessionToken, &sessionUserID,
 		)
 		if err != nil {
 			m.log.Error("读取上游记录失败: %v", err)
@@ -445,6 +450,7 @@ func (m *Manager) loadFromDB() {
 			u.Session = &auth.UpstreamSession{
 				ServerID:   u.ID,
 				Token:      sessionToken,
+				UserID:     sessionUserID,
 				AuthMethod: "restored",
 				AuthedAt:   time.Now(),
 			}
@@ -484,7 +490,8 @@ func (m *Manager) authenticate(u *Upstream) {
 	u.HealthMessage = "认证成功"
 	u.Mu.Unlock()
 
-	_, _ = m.db.Exec(`UPDATE upstreams SET session_token = ?, health_status = 'online' WHERE id = ?`, session.Token, u.ID)
+	_, _ = m.db.Exec(`UPDATE upstreams SET session_token = ?, session_user_id = ?, health_status = 'online' WHERE id = ?`,
+		session.Token, session.UserID, u.ID)
 	m.log.Info("上游 [%s] 认证成功", name)
 }
 
@@ -693,6 +700,20 @@ func (u *Upstream) SetUserID(userID string) {
 		return
 	}
 	u.Session.UserID = strings.TrimSpace(userID)
+}
+
+func (m *Manager) PersistSessionUserID(id int, userID string) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	_, _ = m.db.Exec(`UPDATE upstreams SET session_user_id = ? WHERE id = ?`, userID, id)
+}
+
+func (u *Upstream) GetUsername() string {
+	u.Mu.RLock()
+	defer u.Mu.RUnlock()
+	return u.Username
 }
 
 func (u *Upstream) PlaybackBaseURL() string {

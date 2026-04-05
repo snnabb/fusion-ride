@@ -79,6 +79,7 @@ func (d *DB) migrate() error {
 			enabled          BOOLEAN DEFAULT 1,
 			health_status    TEXT DEFAULT 'unknown',
 			session_token    TEXT DEFAULT '',
+			session_user_id  TEXT DEFAULT '',
 			last_check       INTEGER DEFAULT 0,
 			created_at       INTEGER NOT NULL DEFAULT (unixepoch()),
 			updated_at       INTEGER NOT NULL DEFAULT (unixepoch())
@@ -151,6 +152,9 @@ func (d *DB) migrate() error {
 	}
 
 	if err := ensureColumn(tx, "upstreams", "stream_hosts", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := ensureColumn(tx, "upstreams", "session_user_id", "TEXT DEFAULT ''"); err != nil {
 		return err
 	}
 

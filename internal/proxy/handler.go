@@ -386,28 +386,64 @@ func (h *Handler) resolveUpstreamUserID(ctx context.Context, selected *upstream.
 	resp, err := selected.DoAPI(ctx, http.MethodGet, "/Users/Me", nil)
 	if err != nil {
 		h.log.Warn("获取上游 [%s] 用户信息失败: %v", selected.Name, err)
-		return ""
-	}
-	defer resp.Body.Close()
+	} else {
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		h.log.Warn("获取上游 [%s] 用户信息失败: HTTP %d", selected.Name, resp.StatusCode)
+		if resp.StatusCode == http.StatusOK {
+			var payload struct {
+				ID string `json:"Id"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				h.log.Warn("解析上游 [%s] 用户信息失败: %v", selected.Name, err)
+			} else if payload.ID != "" {
+				selected.SetUserID(payload.ID)
+				h.upMgr.PersistSessionUserID(selected.ID, payload.ID)
+				return payload.ID
+			}
+		} else {
+			h.log.Warn("获取上游 [%s] 用户信息失败: HTTP %d", selected.Name, resp.StatusCode)
+		}
+	}
+
+	resp2, err2 := selected.DoAPI(ctx, http.MethodGet, "/Users?IsHidden=false&IsDisabled=false", nil)
+	if err2 != nil {
+		h.log.Warn("获取上游 [%s] 用户列表失败: %v", selected.Name, err2)
+		return ""
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusOK {
+		h.log.Warn("获取上游 [%s] 用户列表失败: HTTP %d", selected.Name, resp2.StatusCode)
 		return ""
 	}
 
-	var payload struct {
-		ID string `json:"Id"`
+	var users []struct {
+		ID   string `json:"Id"`
+		Name string `json:"Name"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		h.log.Warn("解析上游 [%s] 用户信息失败: %v", selected.Name, err)
-		return ""
-	}
-	if payload.ID == "" {
+	if err := json.NewDecoder(resp2.Body).Decode(&users); err != nil {
+		h.log.Warn("解析上游 [%s] 用户列表失败: %v", selected.Name, err)
 		return ""
 	}
 
-	selected.SetUserID(payload.ID)
-	return payload.ID
+	upstreamUsername := selected.GetUsername()
+	for _, candidate := range users {
+		if candidate.ID == "" {
+			continue
+		}
+		if strings.EqualFold(candidate.Name, upstreamUsername) {
+			selected.SetUserID(candidate.ID)
+			h.upMgr.PersistSessionUserID(selected.ID, candidate.ID)
+			return candidate.ID
+		}
+	}
+	if len(users) > 0 && users[0].ID != "" {
+		selected.SetUserID(users[0].ID)
+		h.upMgr.PersistSessionUserID(selected.ID, users[0].ID)
+		return users[0].ID
+	}
+
+	return ""
 }
 
 func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
