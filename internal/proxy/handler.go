@@ -408,39 +408,46 @@ func (h *Handler) resolveUpstreamUserID(ctx context.Context, selected *upstream.
 	resp2, err2 := selected.DoAPI(ctx, http.MethodGet, "/Users?IsHidden=false&IsDisabled=false", nil)
 	if err2 != nil {
 		h.log.Warn("获取上游 [%s] 用户列表失败: %v", selected.Name, err2)
-		return ""
-	}
-	defer resp2.Body.Close()
+	} else {
+		defer resp2.Body.Close()
 
-	if resp2.StatusCode != http.StatusOK {
-		h.log.Warn("获取上游 [%s] 用户列表失败: HTTP %d", selected.Name, resp2.StatusCode)
-		return ""
-	}
-
-	var users []struct {
-		ID   string `json:"Id"`
-		Name string `json:"Name"`
-	}
-	if err := json.NewDecoder(resp2.Body).Decode(&users); err != nil {
-		h.log.Warn("解析上游 [%s] 用户列表失败: %v", selected.Name, err)
-		return ""
-	}
-
-	upstreamUsername := selected.GetUsername()
-	for _, candidate := range users {
-		if candidate.ID == "" {
-			continue
+		if resp2.StatusCode != http.StatusOK {
+			h.log.Warn("获取上游 [%s] 用户列表失败: HTTP %d", selected.Name, resp2.StatusCode)
+		} else {
+			var users []struct {
+				ID   string `json:"Id"`
+				Name string `json:"Name"`
+			}
+			if err := json.NewDecoder(resp2.Body).Decode(&users); err != nil {
+				h.log.Warn("解析上游 [%s] 用户列表失败: %v", selected.Name, err)
+			} else {
+				upstreamUsername := selected.GetUsername()
+				for _, candidate := range users {
+					if candidate.ID == "" {
+						continue
+					}
+					if strings.EqualFold(candidate.Name, upstreamUsername) {
+						selected.SetUserID(candidate.ID)
+						h.upMgr.PersistSessionUserID(selected.ID, candidate.ID)
+						return candidate.ID
+					}
+				}
+				if len(users) > 0 && users[0].ID != "" {
+					selected.SetUserID(users[0].ID)
+					h.upMgr.PersistSessionUserID(selected.ID, users[0].ID)
+					return users[0].ID
+				}
+			}
 		}
-		if strings.EqualFold(candidate.Name, upstreamUsername) {
-			selected.SetUserID(candidate.ID)
-			h.upMgr.PersistSessionUserID(selected.ID, candidate.ID)
-			return candidate.ID
-		}
 	}
-	if len(users) > 0 && users[0].ID != "" {
-		selected.SetUserID(users[0].ID)
-		h.upMgr.PersistSessionUserID(selected.ID, users[0].ID)
-		return users[0].ID
+
+	if err := h.upMgr.RefreshSession(selected.ID); err != nil {
+		h.log.Warn("刷新上游 [%s] 会话失败: %v", selected.Name, err)
+		return ""
+	}
+	if userID := selected.GetUserID(); userID != "" {
+		h.upMgr.PersistSessionUserID(selected.ID, userID)
+		return userID
 	}
 
 	return ""

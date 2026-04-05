@@ -342,6 +342,18 @@ func (m *Manager) Reconnect(id int) error {
 	return nil
 }
 
+func (m *Manager) RefreshSession(id int) error {
+	u := m.ByID(id)
+	if u == nil {
+		return fmt.Errorf("上游 %d 不存在", id)
+	}
+	m.authenticate(u)
+	if userID := u.GetUserID(); userID == "" {
+		return fmt.Errorf("上游 %d 未返回用户标识", id)
+	}
+	return nil
+}
+
 func (m *Manager) Reorder(ids []int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -456,7 +468,8 @@ func (m *Manager) loadFromDB() {
 			}
 		}
 
-		m.upstreams = append(m.upstreams, &u)
+		upstreamRef := &u
+		m.upstreams = append(m.upstreams, upstreamRef)
 		m.log.Info("已加载上游 [%s] %s，状态：%s", u.Name, u.URL, u.HealthStatus)
 	}
 }
