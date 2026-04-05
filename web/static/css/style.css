@@ -154,12 +154,37 @@ textarea {
     transition: border-color var(--transition), box-shadow var(--transition);
 }
 
+select {
+    appearance: none;
+    -webkit-appearance: none;
+    padding-right: 40px;
+    background-image:
+        linear-gradient(45deg, transparent 50%, var(--text-secondary) 50%),
+        linear-gradient(135deg, var(--text-secondary) 50%, transparent 50%);
+    background-position:
+        calc(100% - 18px) calc(50% - 2px),
+        calc(100% - 12px) calc(50% - 2px);
+    background-size: 6px 6px, 6px 6px;
+    background-repeat: no-repeat;
+}
+
+select option {
+    background: #12151d;
+    color: rgba(255, 255, 255, 0.92);
+}
+
 input:focus, select:focus, textarea:focus {
     border-color: var(--border-active);
     box-shadow: 0 0 0 3px var(--accent-glow);
 }
 
 input::placeholder { color: var(--text-muted); }
+
+.field-help {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-muted);
+}
 
 .auth-error {
     color: var(--red);
@@ -468,7 +493,10 @@ input::placeholder { color: var(--text-muted); }
 
 .badge-proxy { background: rgba(96, 165, 250, 0.15); color: var(--blue); }
 .badge-redirect { background: var(--yellow-dim); color: var(--yellow); }
+.badge-inherit { background: rgba(255, 255, 255, 0.08); color: var(--text-primary); }
 .badge-infuse { background: rgba(124, 92, 252, 0.15); color: var(--accent-light); }
+.badge-web { background: rgba(96, 165, 250, 0.15); color: #93c5fd; }
+.badge-client { background: rgba(52, 211, 153, 0.15); color: #6ee7b7; }
 .badge-online { background: var(--green-dim); color: var(--green); }
 .badge-offline { background: var(--red-dim); color: var(--red); }
 

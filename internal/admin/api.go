@@ -10,12 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fusionride/fusion-ride/internal/auth"
-	"github.com/fusionride/fusion-ride/internal/config"
-	"github.com/fusionride/fusion-ride/internal/idmap"
-	"github.com/fusionride/fusion-ride/internal/logger"
-	"github.com/fusionride/fusion-ride/internal/traffic"
-	"github.com/fusionride/fusion-ride/internal/upstream"
+	"github.com/snnabb/fusion-ride/internal/auth"
+	"github.com/snnabb/fusion-ride/internal/config"
+	"github.com/snnabb/fusion-ride/internal/idmap"
+	"github.com/snnabb/fusion-ride/internal/logger"
+	"github.com/snnabb/fusion-ride/internal/traffic"
+	"github.com/snnabb/fusion-ride/internal/upstream"
 )
 
 // API is the admin panel REST API handler.
@@ -77,11 +77,11 @@ func (a *API) requireAuth(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
 		if token == "" {
-			jsonError(w, "Unauthorized", http.StatusUnauthorized)
+			jsonError(w, "未授权访问", http.StatusUnauthorized)
 			return
 		}
 		if _, err := a.adminAuth.VerifyToken(token); err != nil {
-			jsonError(w, "Token invalid or expired", http.StatusUnauthorized)
+			jsonError(w, "令牌无效或已过期", http.StatusUnauthorized)
 			return
 		}
 		handler(w, r)
@@ -94,11 +94,11 @@ func (a *API) handleNeedsSetup(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 		return
 	}
 	if !a.adminAuth.NeedsSetup() {
-		jsonError(w, "Already set up", http.StatusConflict)
+		jsonError(w, "管理员已初始化", http.StatusConflict)
 		return
 	}
 
@@ -107,7 +107,7 @@ func (a *API) handleSetup(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := readJSON(r, &req); err != nil {
-		jsonError(w, "Bad request", http.StatusBadRequest)
+		jsonError(w, "请求格式错误", http.StatusBadRequest)
 		return
 	}
 
@@ -118,17 +118,17 @@ func (a *API) handleSetup(w http.ResponseWriter, r *http.Request) {
 
 	token, err := a.adminAuth.Login(req.Username, req.Password)
 	if err != nil {
-		jsonError(w, "Setup ok but login failed", http.StatusInternalServerError)
+		jsonError(w, "初始化成功，但自动登录失败", http.StatusInternalServerError)
 		return
 	}
 
-	a.log.Info("Admin initial setup complete: %s", req.Username)
+	a.log.Info("管理员初始化完成：%s", req.Username)
 	jsonResp(w, map[string]string{"token": token})
 }
 
 func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -137,18 +137,18 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := readJSON(r, &req); err != nil {
-		jsonError(w, "Bad request", http.StatusBadRequest)
+		jsonError(w, "请求格式错误", http.StatusBadRequest)
 		return
 	}
 
 	token, err := a.adminAuth.Login(req.Username, req.Password)
 	if err != nil {
-		a.log.Warn("Admin login failed: %s", req.Username)
+		a.log.Warn("管理员登录失败：%s", req.Username)
 		jsonError(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 
-	a.log.Info("Admin login: %s", req.Username)
+	a.log.Info("管理员登录成功：%s", req.Username)
 	jsonResp(w, map[string]string{"token": token})
 }
 
@@ -164,15 +164,17 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, u := range upstreams {
 		u.Mu.RLock()
 		status := map[string]any{
-			"id":            u.ID,
-			"name":          u.Name,
-			"url":           u.URL,
-			"enabled":       u.Enabled,
-			"healthStatus":  u.HealthStatus,
-			"healthMessage": u.HealthMessage,
-			"playbackMode":  u.PlaybackMode,
-			"spoofMode":     u.SpoofMode,
-			"lastCheck":     u.LastCheck.Unix(),
+			"id":                u.ID,
+			"name":              u.Name,
+			"url":               u.URL,
+			"enabled":           u.Enabled,
+			"healthStatus":      u.HealthStatus,
+			"healthMessage":     u.HealthMessage,
+			"playbackMode":      u.EffectivePlaybackMode(a.cfg.Playback.Mode),
+			"playbackModeRaw":   u.PlaybackMode,
+			"playbackInherited": u.PlaybackMode == "",
+			"spoofMode":         u.SpoofMode,
+			"lastCheck":         u.LastCheck.Unix(),
 		}
 		if u.HealthStatus == "online" {
 			totalOnline++
@@ -184,16 +186,17 @@ func (a *API) handleStatus(w http.ResponseWriter, r *http.Request) {
 	idTotal, idByServer := a.ids.Stats()
 
 	jsonResp(w, map[string]any{
-		"serverName":   a.cfg.Server.Name,
-		"version":      "1.0.0",
-		"port":         a.cfg.Server.Port,
-		"uptime":       int(time.Since(a.startTime).Seconds()),
-		"upstreams":    upstreamStats,
-		"totalOnline":  totalOnline,
-		"totalServers": len(upstreams),
-		"idMappings":   idTotal,
-		"idByServer":   idByServer,
-		"playbackMode": a.cfg.Playback.Mode,
+		"serverName":     a.cfg.Server.Name,
+		"version":        "1.0.0",
+		"port":           a.cfg.Server.Port,
+		"uptime":         int(time.Since(a.startTime).Seconds()),
+		"upstreams":      upstreamStats,
+		"totalOnline":    totalOnline,
+		"totalServers":   len(upstreams),
+		"idMappings":     idTotal,
+		"idByServer":     idByServer,
+		"idMappingsNote": "ID 鏄犲皠浼氬湪瀹㈡埛绔櫥褰曞拰娴忚濯掍綋鏃舵寜闇€鐢熸垚",
+		"playbackMode":   a.cfg.Playback.Mode,
 	})
 }
 
@@ -205,15 +208,21 @@ func (a *API) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 		for _, u := range upstreams {
 			u.Mu.RLock()
 			result = append(result, map[string]any{
-				"id":           u.ID,
-				"name":         u.Name,
-				"url":          u.URL,
-				"enabled":      u.Enabled,
-				"healthStatus": u.HealthStatus,
-				"playbackMode": u.PlaybackMode,
-				"spoofMode":    u.SpoofMode,
-				"priority":     u.Priority,
-				"priorityMeta": u.PriorityMeta,
+				"id":                u.ID,
+				"name":              u.Name,
+				"url":               u.URL,
+				"username":          u.Username,
+				"hasPassword":       u.Password != "",
+				"hasAPIKey":         u.APIKey != "",
+				"streamingURL":      u.StreamingURL,
+				"enabled":           u.Enabled,
+				"healthStatus":      u.HealthStatus,
+				"playbackMode":      u.EffectivePlaybackMode(a.cfg.Playback.Mode),
+				"playbackModeRaw":   u.PlaybackMode,
+				"playbackInherited": u.PlaybackMode == "",
+				"spoofMode":         u.SpoofMode,
+				"priority":          u.Priority,
+				"priorityMeta":      u.PriorityMeta,
 			})
 			u.Mu.RUnlock()
 		}
@@ -230,11 +239,11 @@ func (a *API) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 			SpoofMode    string `json:"spoofMode"`
 		}
 		if err := readJSON(r, &req); err != nil {
-			jsonError(w, "Bad request", http.StatusBadRequest)
+			jsonError(w, "请求格式错误", http.StatusBadRequest)
 			return
 		}
 		if req.Name == "" || req.URL == "" {
-			jsonError(w, "Name and URL are required", http.StatusBadRequest)
+			jsonError(w, "上游名称和地址不能为空", http.StatusBadRequest)
 			return
 		}
 
@@ -248,20 +257,20 @@ func (a *API) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, map[string]any{"id": id, "status": "ok"})
 
 	default:
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 	}
 }
 
 func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/admin/api/upstreams/"), "/")
 	if len(pathParts) == 0 {
-		jsonError(w, "Missing ID", http.StatusBadRequest)
+		jsonError(w, "缺少上游 ID", http.StatusBadRequest)
 		return
 	}
 
 	id, err := strconv.Atoi(pathParts[0])
 	if err != nil {
-		jsonError(w, "Invalid ID", http.StatusBadRequest)
+		jsonError(w, "上游 ID 非法", http.StatusBadRequest)
 		return
 	}
 
@@ -273,7 +282,7 @@ func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 	switch action {
 	case "reconnect":
 		if r.Method != "POST" {
-			jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 			return
 		}
 		if err := a.upMgr.Reconnect(id); err != nil {
@@ -284,12 +293,12 @@ func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 
 	case "test":
 		if r.Method != "POST" {
-			jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 			return
 		}
 		u := a.upMgr.ByID(id)
 		if u == nil {
-			jsonError(w, "Upstream not found", http.StatusNotFound)
+			jsonError(w, "上游不存在", http.StatusNotFound)
 			return
 		}
 		online, msg := auth.CheckUpstreamHealth(u.URL, u.Spoofer.Headers(), 10*time.Second)
@@ -298,12 +307,51 @@ func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		switch r.Method {
 		case "PUT":
-			var req map[string]any
+			var req struct {
+				Name         *string `json:"name"`
+				URL          *string `json:"url"`
+				Username     *string `json:"username"`
+				Password     *string `json:"password"`
+				APIKey       *string `json:"apiKey"`
+				PlaybackMode *string `json:"playbackMode"`
+				SpoofMode    *string `json:"spoofMode"`
+				Enabled      *bool   `json:"enabled"`
+				StreamingURL *string `json:"streamingURL"`
+			}
 			if err := readJSON(r, &req); err != nil {
-				jsonError(w, "Bad request", http.StatusBadRequest)
+				jsonError(w, "请求格式错误", http.StatusBadRequest)
 				return
 			}
-			if err := a.upMgr.Update(id, req); err != nil {
+			fields := map[string]any{}
+			if req.Name != nil {
+				fields["name"] = strings.TrimSpace(*req.Name)
+			}
+			if req.URL != nil {
+				fields["url"] = strings.TrimSpace(*req.URL)
+			}
+			if req.Username != nil {
+				fields["username"] = strings.TrimSpace(*req.Username)
+			}
+			if req.Password != nil {
+				fields["password"] = *req.Password
+			}
+			if req.APIKey != nil {
+				fields["api_key"] = strings.TrimSpace(*req.APIKey)
+			}
+			if req.PlaybackMode != nil {
+				fields["playback_mode"] = strings.TrimSpace(*req.PlaybackMode)
+			}
+			if req.SpoofMode != nil {
+				fields["spoof_mode"] = strings.TrimSpace(*req.SpoofMode)
+			}
+			if req.Enabled != nil {
+				fields["enabled"] = *req.Enabled
+			}
+			if req.StreamingURL != nil {
+				fields["streaming_url"] = strings.TrimSpace(*req.StreamingURL)
+			}
+
+			if err := a.upMgr.Update(id, fields); err != nil {
 				jsonError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -320,21 +368,21 @@ func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 			jsonResp(w, map[string]string{"status": "ok"})
 
 		default:
-			jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 		}
 	}
 }
 
 func (a *API) handleReorder(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "PUT" {
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
 		IDs []int `json:"ids"`
 	}
 	if err := readJSON(r, &req); err != nil {
-		jsonError(w, "Bad request", http.StatusBadRequest)
+		jsonError(w, "请求格式错误", http.StatusBadRequest)
 		return
 	}
 	if err := a.upMgr.Reorder(req.IDs); err != nil {
@@ -359,7 +407,7 @@ func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 	case "PUT":
 		var req map[string]any
 		if err := readJSON(r, &req); err != nil {
-			jsonError(w, "Bad request", http.StatusBadRequest)
+			jsonError(w, "请求格式错误", http.StatusBadRequest)
 			return
 		}
 
@@ -373,13 +421,13 @@ func (a *API) handleSettings(w http.ResponseWriter, r *http.Request) {
 		})
 
 		if err := a.cfg.Save(a.cfgPath); err != nil {
-			a.log.Error("Save config failed: %v", err)
+			a.log.Error("保存配置失败: %v", err)
 		}
 
 		jsonResp(w, map[string]string{"status": "ok"})
 
 	default:
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -425,7 +473,7 @@ func (a *API) handleLogs(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, map[string]string{"status": "ok"})
 
 	default:
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 	}
 }
 
@@ -468,7 +516,7 @@ func (a *API) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		jsonError(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		jsonError(w, "不支持的请求方法", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
@@ -476,7 +524,7 @@ func (a *API) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		NewPassword string `json:"newPassword"`
 	}
 	if err := readJSON(r, &req); err != nil {
-		jsonError(w, "Bad request", http.StatusBadRequest)
+		jsonError(w, "请求格式错误", http.StatusBadRequest)
 		return
 	}
 
@@ -485,7 +533,7 @@ func (a *API) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.log.Info("Admin password changed")
+	a.log.Info("管理员密码已修改")
 	jsonResp(w, map[string]string{"status": "ok"})
 }
 
@@ -505,7 +553,7 @@ func NewSSEHub() *SSEHub {
 func (h *SSEHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		http.Error(w, "当前连接不支持 SSE", http.StatusInternalServerError)
 		return
 	}
 

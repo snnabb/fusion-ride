@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/crypto/scrypt"
 
-	"github.com/fusionride/fusion-ride/internal/db"
+	"github.com/snnabb/fusion-ride/internal/db"
 )
 
 const (
@@ -142,7 +142,7 @@ func (a *AdminAuth) signJWT(username string) (string, error) {
 func (a *AdminAuth) verifyJWT(token string) (string, error) {
 	parts := splitJWT(token)
 	if len(parts) != 3 {
-		return "", fmt.Errorf("invalid token format")
+		return "", fmt.Errorf("令牌格式错误")
 	}
 
 	// 验签
@@ -150,21 +150,21 @@ func (a *AdminAuth) verifyJWT(token string) (string, error) {
 	mac.Write([]byte(parts[0] + "." + parts[1]))
 	expectedSig := base64url(mac.Sum(nil))
 	if !hmac.Equal([]byte(expectedSig), []byte(parts[2])) {
-		return "", fmt.Errorf("invalid signature")
+		return "", fmt.Errorf("令牌签名无效")
 	}
 
 	// 解析 payload
 	payloadJSON, err := base64urlDecode(parts[1])
 	if err != nil {
-		return "", fmt.Errorf("invalid payload")
+		return "", fmt.Errorf("令牌载荷无效")
 	}
 	var payload jwtPayload
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
-		return "", fmt.Errorf("invalid payload")
+		return "", fmt.Errorf("令牌载荷无效")
 	}
 
 	if time.Now().Unix() > payload.Exp {
-		return "", fmt.Errorf("token expired")
+		return "", fmt.Errorf("令牌已过期")
 	}
 
 	return payload.Sub, nil

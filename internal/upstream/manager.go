@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,25 +10,25 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fusionride/fusion-ride/internal/auth"
-	"github.com/fusionride/fusion-ride/internal/db"
-	"github.com/fusionride/fusion-ride/internal/identity"
-	"github.com/fusionride/fusion-ride/internal/logger"
+	"github.com/snnabb/fusion-ride/internal/auth"
+	"github.com/snnabb/fusion-ride/internal/db"
+	"github.com/snnabb/fusion-ride/internal/identity"
+	"github.com/snnabb/fusion-ride/internal/logger"
 )
 
 // Upstream represents a single Emby server.
 type Upstream struct {
 	Mu sync.RWMutex
 
-	ID             int
-	Name           string
-	URL            string
-	PlaybackMode   string // "proxy" | "redirect"
-	StreamingURL   string
-	SpoofMode      string
-	Enabled        bool
-	Priority       int
-	PriorityMeta   bool
+	ID           int
+	Name         string
+	URL          string
+	PlaybackMode string // "proxy" | "redirect"
+	StreamingURL string
+	SpoofMode    string
+	Enabled      bool
+	Priority     int
+	PriorityMeta bool
 
 	// Runtime
 	Session       *auth.UpstreamSession
@@ -106,12 +107,8 @@ func (m *Manager) ByID(id int) *Upstream {
 
 func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoofMode string) (int, error) {
 	url = strings.TrimRight(url, "/")
-	if playbackMode == "" {
-		playbackMode = m.globalPBM
-	}
-	if spoofMode == "" {
-		spoofMode = "infuse"
-	}
+	playbackMode = normalizePlaybackMode(playbackMode)
+	spoofMode = identity.NormalizeMode(spoofMode)
 
 	result, err := m.db.Exec(
 		`INSERT INTO upstreams(name, url, username, password, api_key, playback_mode, spoof_mode)
@@ -119,7 +116,7 @@ func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoof
 		name, url, username, password, apiKey, playbackMode, spoofMode,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("Save failed: %w", err)
+		return 0, fmt.Errorf("淇濆瓨涓婃父澶辫触: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
@@ -142,7 +139,7 @@ func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoof
 	m.upstreams = append(m.upstreams, u)
 	m.mu.Unlock()
 
-	m.log.Info("Add upstream [%s] %s", name, url)
+	m.log.Info("宸叉坊鍔犱笂娓?[%s] %s", name, url)
 
 	go m.authenticate(u)
 
@@ -161,7 +158,7 @@ func (m *Manager) Remove(id int) error {
 		}
 	}
 	if idx == -1 {
-		return fmt.Errorf("Upstream %d does not exist", id)
+		return fmt.Errorf("?? %d ???", id)
 	}
 
 	name := m.upstreams[idx].Name
@@ -171,21 +168,67 @@ func (m *Manager) Remove(id int) error {
 	}
 
 	m.upstreams = append(m.upstreams[:idx], m.upstreams[idx+1:]...)
-	m.log.Info("Removed upstream [%s]", name)
+	m.log.Info("宸茬Щ闄や笂娓?[%s]", name)
 	return nil
 }
 
 func (m *Manager) Update(id int, fields map[string]any) error {
 	u := m.ByID(id)
 	if u == nil {
-		return fmt.Errorf("Upstream %d does not exist", id)
+		return fmt.Errorf("?? %d ???", id)
 	}
 
 	setClauses := make([]string, 0, len(fields))
 	values := make([]any, 0, len(fields))
+	normalized := make(map[string]any, len(fields))
 	for k, v := range fields {
+		switch k {
+		case "name", "username", "password", "api_key", "streaming_url":
+			value, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("?? %d ??? %s ?????", id, k)
+			}
+			normalized[k] = value
+		case "url":
+			value, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("?? %d ? URL ?????", id)
+			}
+			normalized[k] = strings.TrimRight(value, "/")
+		case "playback_mode":
+			value, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("?? %d ??????????", id)
+			}
+			normalized[k] = normalizePlaybackMode(value)
+		case "spoof_mode":
+			value, ok := v.(string)
+			if !ok {
+				return fmt.Errorf("?? %d ? UA ?????????", id)
+			}
+			normalized[k] = identity.NormalizeMode(value)
+		case "enabled", "priority_meta", "follow_redirects":
+			value, ok := v.(bool)
+			if !ok {
+				return fmt.Errorf("?? %d ??? %s ?????", id, k)
+			}
+			normalized[k] = value
+		case "priority":
+			value, ok := v.(int)
+			if !ok {
+				return fmt.Errorf("?? %d ?????????", id)
+			}
+			normalized[k] = value
+		default:
+			return fmt.Errorf("??????? %s", k)
+		}
+	}
+	for k, v := range normalized {
 		setClauses = append(setClauses, k+" = ?")
 		values = append(values, v)
+	}
+	if len(setClauses) == 0 {
+		return nil
 	}
 	values = append(values, id)
 
@@ -197,19 +240,60 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 	}
 
 	u.Mu.Lock()
-	if v, ok := fields["name"]; ok {
+	shouldReconnect := false
+	if v, ok := normalized["name"]; ok {
 		u.Name = v.(string)
 	}
-	if v, ok := fields["url"]; ok {
+	if v, ok := normalized["url"]; ok {
 		u.URL = strings.TrimRight(v.(string), "/")
+		shouldReconnect = true
 	}
-	if v, ok := fields["playback_mode"]; ok {
+	if v, ok := normalized["playback_mode"]; ok {
 		u.PlaybackMode = v.(string)
 	}
-	if v, ok := fields["enabled"]; ok {
-		u.Enabled = v.(bool)
+	if v, ok := normalized["username"]; ok {
+		u.Username = v.(string)
+		shouldReconnect = true
 	}
+	if v, ok := normalized["password"]; ok {
+		u.Password = v.(string)
+		shouldReconnect = true
+	}
+	if v, ok := normalized["api_key"]; ok {
+		u.APIKey = v.(string)
+		shouldReconnect = true
+	}
+	if v, ok := normalized["spoof_mode"]; ok {
+		u.SpoofMode = v.(string)
+		u.Spoofer = identity.NewSpoofer(u.SpoofMode, "", "", "", "", "")
+		shouldReconnect = true
+	}
+	if v, ok := normalized["streaming_url"]; ok {
+		u.StreamingURL = strings.TrimRight(v.(string), "/")
+	}
+	if v, ok := normalized["priority"]; ok {
+		u.Priority = v.(int)
+	}
+	if v, ok := normalized["priority_meta"]; ok {
+		u.PriorityMeta = v.(bool)
+	}
+	if v, ok := normalized["enabled"]; ok {
+		u.Enabled = v.(bool)
+		if u.Enabled {
+			shouldReconnect = true
+		}
+	}
+	if shouldReconnect {
+		u.Session = nil
+		u.HealthStatus = "unknown"
+		u.HealthMessage = "??????"
+	}
+	enabled := u.Enabled
 	u.Mu.Unlock()
+
+	if shouldReconnect && enabled {
+		go m.authenticate(u)
+	}
 
 	return nil
 }
@@ -217,7 +301,7 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 func (m *Manager) Reconnect(id int) error {
 	u := m.ByID(id)
 	if u == nil {
-		return fmt.Errorf("Upstream %d does not exist", id)
+		return fmt.Errorf("?? %d ???", id)
 	}
 	go m.authenticate(u)
 	return nil
@@ -276,7 +360,12 @@ func (m *Manager) StartHealthChecks(interval time.Duration, checkTimeout time.Du
 }
 
 func (m *Manager) Stop() {
-	close(m.stopCh)
+	select {
+	case <-m.stopCh:
+		return
+	default:
+		close(m.stopCh)
+	}
 }
 
 func (m *Manager) loadFromDB() {
@@ -287,7 +376,7 @@ func (m *Manager) loadFromDB() {
 		        enabled, health_status, session_token
 		 FROM upstreams ORDER BY priority ASC`)
 	if err != nil {
-		m.log.Error("Load upstreams failed: %v", err)
+		m.log.Error("鍔犺浇涓婃父鍒楄〃澶辫触: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -305,11 +394,13 @@ func (m *Manager) loadFromDB() {
 			&u.Enabled, &u.HealthStatus, &sessionToken,
 		)
 		if err != nil {
-			m.log.Error("Read row failed: %v", err)
+			m.log.Error("璇诲彇涓婃父璁板綍澶辫触: %v", err)
 			continue
 		}
 
 		u.URL = strings.TrimRight(u.URL, "/")
+		u.PlaybackMode = normalizePlaybackMode(u.PlaybackMode)
+		u.SpoofMode = identity.NormalizeMode(u.SpoofMode)
 		u.Spoofer = identity.NewSpoofer(u.SpoofMode, customUA, customClient, customVer, customDev, customDevID)
 		u.Client = &http.Client{Timeout: 30 * time.Second}
 
@@ -323,7 +414,7 @@ func (m *Manager) loadFromDB() {
 		}
 
 		m.upstreams = append(m.upstreams, &u)
-		m.log.Info("Loaded upstream [%s] %s (Status: %s)", u.Name, u.URL, u.HealthStatus)
+		m.log.Info("????? [%s] %s????%s?", u.Name, u.URL, u.HealthStatus)
 	}
 }
 
@@ -336,14 +427,14 @@ func (m *Manager) authenticate(u *Upstream) {
 	headers := u.Spoofer.Headers()
 	u.Mu.Unlock()
 
-	m.log.Info("Authenticating upstream [%s] ...", u.Name)
+	m.log.Info("姝ｅ湪璁よ瘉涓婃父 [%s]", u.Name)
 
 	session, err := auth.AuthenticateUpstream(
 		baseURL, username, password, apiKey, headers,
 		10*time.Second,
 	)
 	if err != nil {
-		m.log.Error("Upstream [%s] auth failed: %v", u.Name, err)
+		m.log.Error("涓婃父 [%s] 璁よ瘉澶辫触: %v", u.Name, err)
 		u.Mu.Lock()
 		u.HealthStatus = "offline"
 		u.HealthMessage = err.Error()
@@ -355,13 +446,13 @@ func (m *Manager) authenticate(u *Upstream) {
 	u.Mu.Lock()
 	u.Session = session
 	u.HealthStatus = "online"
-	u.HealthMessage = "Authenticated"
+	u.HealthMessage = "璁よ瘉鎴愬姛"
 	u.Mu.Unlock()
 
 	m.db.Exec(`UPDATE upstreams SET session_token = ?, health_status = 'online' WHERE id = ?`,
 		session.Token, u.ID)
 
-	m.log.Info("Upstream [%s] auth success", u.Name)
+	m.log.Info("涓婃父 [%s] 璁よ瘉鎴愬姛", u.Name)
 }
 
 func (m *Manager) checkAllHealth(timeout time.Duration) {
@@ -398,12 +489,12 @@ func (m *Manager) checkAllHealth(timeout time.Duration) {
 
 			if prevStatus != newStatus {
 				if newStatus == "online" {
-					m.log.Info("Upstream [%s] OFFLINE -> ONLINE: %s", u.Name, msg)
+					m.log.Info("?? [%s] ??????? -> ???%s", u.Name, msg)
 					if u.Session == nil {
 						go m.authenticate(u)
 					}
 				} else {
-					m.log.Warn("Upstream [%s] ONLINE -> OFFLINE: %s", u.Name, msg)
+					m.log.Warn("?? [%s] ??????? -> ???%s", u.Name, msg)
 				}
 			}
 
@@ -415,7 +506,7 @@ func (m *Manager) checkAllHealth(timeout time.Duration) {
 	wg.Wait()
 }
 
-func (u *Upstream) DoAPI(method, path string, body io.Reader) (*http.Response, error) {
+func (u *Upstream) DoAPI(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	u.Mu.RLock()
 	baseURL := u.URL
 	session := u.Session
@@ -423,11 +514,15 @@ func (u *Upstream) DoAPI(method, path string, body io.Reader) (*http.Response, e
 	u.Mu.RUnlock()
 
 	if session == nil {
-		return nil, fmt.Errorf("Upstream [%s] not authenticated", u.Name)
+		return nil, fmt.Errorf("涓婃父 [%s] 灏氭湭璁よ瘉", u.Name)
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	url := baseURL + path
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
 	}
@@ -440,8 +535,56 @@ func (u *Upstream) DoAPI(method, path string, body io.Reader) (*http.Response, e
 	return u.Client.Do(req)
 }
 
-func (u *Upstream) DoAPIJSON(method, path string, body io.Reader, result any) error {
-	resp, err := u.DoAPI(method, path, body)
+func (u *Upstream) DoAPIWithHeaders(ctx context.Context, method, path string, body io.Reader, incoming http.Header) (*http.Response, error) {
+	u.Mu.RLock()
+	baseURL := u.URL
+	session := u.Session
+	spoofer := u.Spoofer
+	client := u.Client
+	u.Mu.RUnlock()
+
+	if session == nil {
+		return nil, fmt.Errorf("娑撳﹥鐖?[%s] 鐏忔碍婀拋銈堢槈", u.Name)
+	}
+	if spoofer == nil {
+		spoofer = identity.NewSpoofer("infuse", "", "", "", "", "")
+	}
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	url := baseURL + path
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	copyForwardHeaders(req.Header, incoming)
+	if incoming != nil {
+		if token := strings.TrimSpace(incoming.Get("X-Emby-Token")); token != "" {
+			req.Header.Set("X-Emby-Token", token)
+		} else {
+			req.Header.Set("X-Emby-Token", session.Token)
+		}
+	} else {
+		req.Header.Set("X-Emby-Token", session.Token)
+	}
+	if incoming != nil {
+		if auth := incoming.Get("Authorization"); auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		if auth := incoming.Get("X-Emby-Authorization"); auth != "" {
+			req.Header.Set("X-Emby-Authorization", auth)
+		}
+	}
+	spoofer.ApplyToHeader(req.Header)
+
+	return client.Do(req)
+}
+
+func (u *Upstream) DoAPIJSON(ctx context.Context, method, path string, body io.Reader, result any) error {
+	resp, err := u.DoAPI(ctx, method, path, body)
 	if err != nil {
 		return err
 	}
@@ -449,10 +592,57 @@ func (u *Upstream) DoAPIJSON(method, path string, body io.Reader, result any) er
 
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+		return fmt.Errorf("涓婃父杩斿洖 HTTP %d: %s", resp.StatusCode, string(b))
 	}
 
 	return json.NewDecoder(resp.Body).Decode(result)
+}
+
+func normalizePlaybackMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "inherit":
+		return ""
+	case "redirect":
+		return "redirect"
+	default:
+		return "proxy"
+	}
+}
+
+func copyForwardHeaders(dst http.Header, src http.Header) {
+	if src == nil {
+		return
+	}
+
+	skipped := map[string]struct{}{
+		"Authorization":         {},
+		"Connection":            {},
+		"Content-Length":        {},
+		"Host":                  {},
+		"Keep-Alive":            {},
+		"Proxy-Connection":      {},
+		"Te":                    {},
+		"Trailer":               {},
+		"Transfer-Encoding":     {},
+		"Upgrade":               {},
+		"User-Agent":            {},
+		"X-Emby-Authorization":  {},
+		"X-Emby-Client":         {},
+		"X-Emby-Client-Version": {},
+		"X-Emby-Device-Id":      {},
+		"X-Emby-Device-Name":    {},
+		"X-Emby-Token":          {},
+	}
+
+	for key, values := range src {
+		canonical := http.CanonicalHeaderKey(key)
+		if _, skip := skipped[canonical]; skip {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
 }
 
 func (u *Upstream) EffectivePlaybackMode(globalMode string) string {

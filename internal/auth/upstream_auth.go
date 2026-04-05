@@ -50,7 +50,7 @@ func authenticateByAPIKey(baseURL, apiKey string, timeout time.Duration) (*Upstr
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("API Key 验证失败: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("API Key 验证失败，上游返回 HTTP %d", resp.StatusCode)
 	}
 
 	return &UpstreamSession{
@@ -101,7 +101,7 @@ func authenticateByName(baseURL, username, password string, headers map[string]s
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("登录失败: HTTP %d - %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("登录失败，上游返回 HTTP %d - %s", resp.StatusCode, string(respBody))
 	}
 
 	var result struct {
@@ -159,5 +159,5 @@ func CheckUpstreamHealth(baseURL string, headers map[string]string, timeout time
 		return true, fmt.Sprintf("%s (v%s)", info.ServerName, info.Version)
 	}
 
-	return false, fmt.Sprintf("HTTP %d", resp.StatusCode)
+	return false, fmt.Sprintf("上游返回 HTTP %d", resp.StatusCode)
 }

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/fusionride/fusion-ride/internal/db"
+	"github.com/snnabb/fusion-ride/internal/db"
 )
 
 // Store 管理虚拟 ID ↔ 原始 ID 的双向映射。

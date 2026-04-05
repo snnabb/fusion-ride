@@ -1,0 +1,65 @@
+# FusionRide 示例配置
+# 复制为 config/config.yaml 后按需修改。
+
+server:
+  # HTTP 监听端口
+  port: 8096
+  # 对外展示的服务名
+  name: "FusionRide"
+  # 虚拟聚合服务器 ID
+  id: "fusionride"
+
+admin:
+  # 管理员用户名。密码首次启动后建议通过管理面板设置。
+  username: "admin"
+  password: ""
+
+playback:
+  # 全局默认播放模式: proxy | redirect
+  mode: "proxy"
+
+timeouts:
+  # 上游普通 API 请求超时，单位毫秒
+  api: 30000
+  # 聚合请求总超时，单位毫秒
+  aggregate: 15000
+  # 登录请求超时，单位毫秒
+  login: 10000
+  # 健康检查超时，单位毫秒
+  healthCheck: 10000
+  # 健康检查轮询间隔，单位毫秒
+  healthInterval: 60000
+
+bitrate:
+  # 是否优先选择更高码率媒体源
+  preferHighest: true
+  # 编解码器优先级，越靠前优先级越高
+  codecPriority:
+    - "hevc"
+    - "av1"
+    - "h264"
+
+# 预留代理配置，当前版本可保持为空
+proxies: []
+
+upstream:
+  # 可配置多个 Emby 上游
+  - name: "emby-main"
+    url: "https://emby.example.com"
+    username: ""
+    password: ""
+    apiKey: ""
+    # 单上游播放模式，留空时继承 playback.mode
+    playbackMode: ""
+    # 可选的直连流媒体地址，redirect 模式常用
+    streamingUrl: ""
+    # 伪装客户端模式，可选: infuse | web | client
+    spoofClient: "infuse"
+    customUserAgent: ""
+    customClient: ""
+    customClientVersion: ""
+    customDeviceName: ""
+    customDeviceId: ""
+    proxyId: ""
+    priorityMetadata: false
+    followRedirects: true

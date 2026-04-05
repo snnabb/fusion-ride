@@ -1,4 +1,4 @@
-module github.com/fusionride/fusion-ride
+module github.com/snnabb/fusion-ride
 
 go 1.22.0
 

@@ -9,15 +9,19 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// DB 封装 SQLite 数据库连接。
+const DefaultFileName = "fusionride.db"
+
 type DB struct {
 	*sql.DB
 }
 
-// Open 打开或创建数据库，自动执行 schema 迁移。
+func New(dataDir string) (*DB, error) {
+	return Open(filepath.Join(dataDir, DefaultFileName))
+}
+
 func Open(path string) (*DB, error) {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建数据目录失败: %w", err)
 	}
 
@@ -27,16 +31,16 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("打开数据库失败: %w", err)
 	}
 
-	sqlDB.SetMaxOpenConns(1) // SQLite 单写
+	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(2)
 
-	d := &DB{sqlDB}
-	if err := d.migrate(); err != nil {
-		sqlDB.Close()
+	database := &DB{DB: sqlDB}
+	if err := database.migrate(); err != nil {
+		_ = sqlDB.Close()
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
 
-	return d, nil
+	return database, nil
 }
 
 func (d *DB) migrate() error {
@@ -124,7 +128,6 @@ func (d *DB) migrate() error {
 			FOREIGN KEY(server_id) REFERENCES upstreams(id) ON DELETE CASCADE
 		)`,
 
-		// 索引
 		`CREATE INDEX IF NOT EXISTS idx_id_mapping_original ON id_mapping(original_id, server_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_id_instances_virtual ON id_instances(virtual_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_traffic_upstream ON traffic_stats(upstream_id, timestamp)`,
@@ -136,15 +139,17 @@ func (d *DB) migrate() error {
 	}
 	defer tx.Rollback()
 
-	for _, m := range migrations {
-		if _, err := tx.Exec(m); err != nil {
-			return fmt.Errorf("执行迁移失败: %s → %w", m[:min(60, len(m))], err)
+	for _, migration := range migrations {
+		if _, err := tx.Exec(migration); err != nil {
+			preview := migration
+			if len(preview) > 60 {
+				preview = preview[:60]
+			}
+			return fmt.Errorf("执行迁移失败: %s: %w", preview, err)
 		}
 	}
 
-	// 确保 schema 版本
-	_, err = tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '1')`)
-	if err != nil {
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '1')`); err != nil {
 		return err
 	}
 

@@ -1,155 +1,144 @@
 package identity
 
 import (
+	"net/http"
+	"regexp"
 	"strings"
 )
 
-// Spoofer 生成伪装的 Emby 客户端标识头。
+type Profile struct {
+	Name       string
+	UserAgent  string
+	Client     string
+	Version    string
+	DeviceName string
+	DeviceID   string
+}
+
 type Spoofer struct {
-	mode string
-
-	// custom 模式字段
-	userAgent   string
-	client      string
-	version     string
-	deviceName  string
-	deviceID    string
+	mode    string
+	profile Profile
 }
 
-// Infuse 默认值
-var infuseDefaults = map[string]string{
-	"User-Agent":        "Infuse/7.8.2 (iPhone; iOS 18.1; Scale/3.00)",
-	"X-Emby-Client":    "Infuse",
-	"X-Emby-Device-Name": "iPhone",
-	"X-Emby-Device-Id":   "F53801B1-261C-4C52-8A40-DCBD9E3E6E5C",
-	"X-Emby-Client-Version": "7.8.2",
+var (
+	clientFieldPattern   = regexp.MustCompile(`Client="[^"]*"`)
+	versionFieldPattern  = regexp.MustCompile(`Version="[^"]*"`)
+	deviceFieldPattern   = regexp.MustCompile(`Device="[^"]*"`)
+	deviceIDFieldPattern = regexp.MustCompile(`DeviceId="[^"]*"`)
+)
+
+var uaProfiles = map[string]Profile{
+	"infuse": {
+		Name:       "Infuse",
+		UserAgent:  "Infuse/7.8.1",
+		Client:     "Infuse",
+		Version:    "7.8.1",
+		DeviceName: "iPhone",
+		DeviceID:   "fusionride-infuse",
+	},
+	"web": {
+		Name:       "Web",
+		UserAgent:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Emby Theater",
+		Client:     "Emby Web",
+		Version:    "4.9.0.42",
+		DeviceName: "Chrome",
+		DeviceID:   "fusionride-web",
+	},
+	"client": {
+		Name:       "Client",
+		UserAgent:  "Emby-Theater/4.7.0",
+		Client:     "Emby Theater",
+		Version:    "4.7.0",
+		DeviceName: "Windows",
+		DeviceID:   "fusionride-client",
+	},
 }
 
-// NewSpoofer 创建 UA 伪装器。
-// mode: "none" | "passthrough" | "infuse" | "custom"
-func NewSpoofer(mode, ua, client, version, device, deviceID string) *Spoofer {
-	if mode == "" {
-		mode = "infuse"
-	}
-	return &Spoofer{
-		mode:       mode,
-		userAgent:  ua,
-		client:     client,
-		version:    version,
-		deviceName: device,
-		deviceID:   deviceID,
-	}
-}
-
-// Headers 返回应该设置的请求头。
-func (s *Spoofer) Headers() map[string]string {
-	switch s.mode {
-	case "none":
-		return map[string]string{
-			"User-Agent":             "FusionRide/1.0",
-			"X-Emby-Client":         "FusionRide",
-			"X-Emby-Device-Name":    "Server",
-			"X-Emby-Device-Id":      "fusionride-default",
-			"X-Emby-Client-Version": "1.0.0",
-		}
-
-	case "infuse":
-		h := make(map[string]string, len(infuseDefaults))
-		for k, v := range infuseDefaults {
-			h[k] = v
-		}
-		return h
-
-	case "custom":
-		h := make(map[string]string, 5)
-		if s.userAgent != "" {
-			h["User-Agent"] = s.userAgent
-		} else {
-			h["User-Agent"] = infuseDefaults["User-Agent"]
-		}
-		if s.client != "" {
-			h["X-Emby-Client"] = s.client
-		} else {
-			h["X-Emby-Client"] = "FusionRide"
-		}
-		if s.deviceName != "" {
-			h["X-Emby-Device-Name"] = s.deviceName
-		} else {
-			h["X-Emby-Device-Name"] = "Server"
-		}
-		if s.deviceID != "" {
-			h["X-Emby-Device-Id"] = s.deviceID
-		} else {
-			h["X-Emby-Device-Id"] = "fusionride-custom"
-		}
-		if s.version != "" {
-			h["X-Emby-Client-Version"] = s.version
-		} else {
-			h["X-Emby-Client-Version"] = "1.0.0"
-		}
-		return h
-
-	case "passthrough":
-		// passthrough 模式在请求时动态处理，这里返回 Infuse 兜底
-		h := make(map[string]string, len(infuseDefaults))
-		for k, v := range infuseDefaults {
-			h[k] = v
-		}
-		return h
-
+func NormalizeMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "infuse":
+		return "infuse"
+	case "web":
+		return "web"
+	case "client", "passthrough":
+		return "client"
 	default:
-		return map[string]string{
-			"User-Agent": "FusionRide/1.0",
-		}
+		return "infuse"
 	}
 }
 
-// Mode 返回当前伪装模式。
+func NewSpoofer(mode, _, _, _, _, _ string) *Spoofer {
+	normalized := NormalizeMode(mode)
+	return &Spoofer{
+		mode:    normalized,
+		profile: uaProfiles[normalized],
+	}
+}
+
+func (s *Spoofer) Headers() map[string]string {
+	return map[string]string{
+		"User-Agent":            s.profile.UserAgent,
+		"X-Emby-Client":         s.profile.Client,
+		"X-Emby-Device-Name":    s.profile.DeviceName,
+		"X-Emby-Device-Id":      s.profile.DeviceID,
+		"X-Emby-Client-Version": s.profile.Version,
+		"X-Emby-Authorization":  s.BuildAuthorizationHeader(),
+	}
+}
+
 func (s *Spoofer) Mode() string {
 	return s.mode
 }
 
-// ApplyPassthrough 用客户端的真实头覆盖（passthrough 模式）。
-func (s *Spoofer) ApplyPassthrough(reqHeaders map[string]string) map[string]string {
-	if s.mode != "passthrough" {
-		return s.Headers()
+func (s *Spoofer) ApplyToHeader(header http.Header) {
+	if header == nil {
+		return
 	}
 
-	h := s.Headers() // Infuse 兜底
+	incomingXEmbyAuth := header.Get("X-Emby-Authorization")
+	incomingAuth := header.Get("Authorization")
 
-	// 五级解析：优先使用请求中的真实头
-	passthroughKeys := []string{
-		"User-Agent",
-		"X-Emby-Client",
-		"X-Emby-Device-Name",
-		"X-Emby-Device-Id",
-		"X-Emby-Client-Version",
+	header.Set("User-Agent", s.profile.UserAgent)
+	header.Set("X-Emby-Client", s.profile.Client)
+	header.Set("X-Emby-Device-Name", s.profile.DeviceName)
+	header.Set("X-Emby-Device-Id", s.profile.DeviceID)
+	header.Set("X-Emby-Client-Version", s.profile.Version)
+
+	if incomingXEmbyAuth != "" {
+		header.Set("X-Emby-Authorization", s.rewriteAuthorization(incomingXEmbyAuth))
+	} else {
+		header.Set("X-Emby-Authorization", s.BuildAuthorizationHeader())
 	}
 
-	for _, key := range passthroughKeys {
-		if v, ok := reqHeaders[key]; ok && v != "" {
-			h[key] = v
-		}
+	if incomingAuth != "" {
+		header.Set("Authorization", s.rewriteAuthorization(incomingAuth))
 	}
-
-	return h
 }
 
-// BuildAuthorizationHeader 构建 X-Emby-Authorization 头。
 func (s *Spoofer) BuildAuthorizationHeader() string {
-	h := s.Headers()
 	parts := []string{
-		`MediaBrowser Client="` + getOrDefault(h, "X-Emby-Client", "FusionRide") + `"`,
-		`Device="` + getOrDefault(h, "X-Emby-Device-Name", "Server") + `"`,
-		`DeviceId="` + getOrDefault(h, "X-Emby-Device-Id", "fusionride") + `"`,
-		`Version="` + getOrDefault(h, "X-Emby-Client-Version", "1.0.0") + `"`,
+		`MediaBrowser Client="` + s.profile.Client + `"`,
+		`Device="` + s.profile.DeviceName + `"`,
+		`DeviceId="` + s.profile.DeviceID + `"`,
+		`Version="` + s.profile.Version + `"`,
 	}
 	return strings.Join(parts, ", ")
 }
 
-func getOrDefault(m map[string]string, key, def string) string {
-	if v, ok := m[key]; ok {
-		return v
+func (s *Spoofer) rewriteAuthorization(value string) string {
+	value = replaceOrAppend(value, clientFieldPattern, `Client="`+s.profile.Client+`"`)
+	value = replaceOrAppend(value, deviceFieldPattern, `Device="`+s.profile.DeviceName+`"`)
+	value = replaceOrAppend(value, deviceIDFieldPattern, `DeviceId="`+s.profile.DeviceID+`"`)
+	value = replaceOrAppend(value, versionFieldPattern, `Version="`+s.profile.Version+`"`)
+	return value
+}
+
+func replaceOrAppend(input string, pattern *regexp.Regexp, replacement string) string {
+	if pattern.MatchString(input) {
+		return pattern.ReplaceAllString(input, replacement)
 	}
-	return def
+	if strings.TrimSpace(input) == "" {
+		return replacement
+	}
+	return input + `, ` + replacement
 }

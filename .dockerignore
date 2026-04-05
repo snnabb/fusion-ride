@@ -1,0 +1,12 @@
+.git
+.worktrees
+worktrees
+deploy.go
+deploy.exe
+deploy_win.exe
+*.md
+data
+.gitignore
+fusionride
+fusionride-*
+*.exe

@@ -6,6 +6,67 @@ const API = '/admin/api';
 let token = localStorage.getItem('fr_token') || '';
 let sseSource = null;
 let currentPage = '';
+let currentUpstreams = [];
+
+const PLAYBACK_OPTIONS = [
+    { value: 'inherit', label: '继承全局默认' },
+    { value: 'proxy', label: '代理中转' },
+    { value: 'redirect', label: '302 直连' },
+];
+
+const GLOBAL_PLAYBACK_OPTIONS = PLAYBACK_OPTIONS.filter(option => option.value !== 'inherit');
+
+const SPOOF_OPTIONS = [
+    { value: 'infuse', label: 'Infuse' },
+    { value: 'web', label: 'Web' },
+    { value: 'client', label: '客户端' },
+];
+
+function normalizeSpoofMode(mode) {
+    return ['infuse', 'web', 'client'].includes(mode) ? mode : 'infuse';
+}
+
+function normalizePlaybackChoice(upstream) {
+    if (!upstream || upstream.playbackInherited || !upstream.playbackModeRaw) {
+        return 'inherit';
+    }
+    return upstream.playbackModeRaw;
+}
+
+function playbackText(mode) {
+    return mode === 'redirect' ? '302 直连' : '代理中转';
+}
+
+function spoofText(mode) {
+    switch (normalizeSpoofMode(mode)) {
+        case 'web':
+            return 'Web';
+        case 'client':
+            return '客户端';
+        default:
+            return 'Infuse';
+    }
+}
+
+function playbackBadgeClass(upstream) {
+    return upstream && upstream.playbackInherited ? 'inherit' : (upstream?.playbackMode || 'proxy');
+}
+
+function playbackBadgeText(upstream) {
+    if (!upstream) return playbackText('proxy');
+    if (upstream.playbackInherited) {
+        return `继承全局 · ${playbackText(upstream.playbackMode || 'proxy')}`;
+    }
+    return playbackText(upstream.playbackMode || 'proxy');
+}
+
+function renderOptions(options, selectedValue) {
+    return options.map(option => `
+        <option value="${option.value}" ${option.value === selectedValue ? 'selected' : ''}>
+            ${option.label}
+        </option>
+    `).join('');
+}
 
 // ── 启动 ──
 document.addEventListener('DOMContentLoaded', init);
@@ -126,44 +187,46 @@ function handleRoute() {
 async function renderDashboard(el) {
     try {
         const status = await api('GET', '/status');
-
         const onlineCount = status.totalOnline || 0;
         const totalCount = status.totalServers || 0;
         const uptimeStr = formatUptime(status.uptime || 0);
+        const mappingNote = status.idMappingsNote || '映射会在用户浏览媒体时按需生成';
+
+        currentUpstreams = status.upstreams || [];
 
         el.innerHTML = `
             <div class="page-header">
                 <h1 class="page-title">仪表盘</h1>
-                <p class="page-desc">系统概览 · ${status.serverName || 'FusionRide'}</p>
+                <p class="page-desc">当前运行实例 · ${status.serverName || 'FusionRide'}</p>
             </div>
 
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-label">在线上游</div>
                     <div class="stat-value green">${onlineCount}</div>
-                    <div class="stat-sub">共 ${totalCount} 台服务器</div>
+                    <div class="stat-sub">共 ${totalCount} 个上游</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-label">ID 映射</div>
+                    <div class="stat-label">ID 映射数量</div>
                     <div class="stat-value accent">${(status.idMappings || 0).toLocaleString()}</div>
-                    <div class="stat-sub">虚拟 ID 总数</div>
+                    <div class="stat-sub">${esc(mappingNote)}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">运行时间</div>
                     <div class="stat-value" style="font-size:24px">${uptimeStr}</div>
-                    <div class="stat-sub">自上次启动</div>
+                    <div class="stat-sub">自服务启动以来</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-label">播放模式</div>
-                    <div class="stat-value" style="font-size:24px">${status.playbackMode || 'proxy'}</div>
-                    <div class="stat-sub">全局默认</div>
+                    <div class="stat-label">全局默认播放模式</div>
+                    <div class="stat-value" style="font-size:24px">${playbackText(status.playbackMode || 'proxy')}</div>
+                    <div class="stat-sub">上游未单独设置时统一使用</div>
                 </div>
             </div>
 
             <div class="card">
-                <div class="card-title">🖥️ 上游服务器状态</div>
+                <div class="card-title">上游状态</div>
                 <div class="upstream-list" id="dash-upstream-list">
-                    ${(status.upstreams || []).map(u => `
+                    ${currentUpstreams.map(u => `
                         <div class="upstream-card">
                             <div class="status-dot ${u.healthStatus}"></div>
                             <div class="upstream-info">
@@ -171,17 +234,17 @@ async function renderDashboard(el) {
                                 <div class="upstream-url">${esc(u.url)}</div>
                             </div>
                             <div class="upstream-meta">
-                                <span class="badge badge-${u.playbackMode || 'proxy'}">${u.playbackMode || 'proxy'}</span>
+                                <span class="badge badge-${playbackBadgeClass(u)}">${esc(playbackBadgeText(u))}</span>
                                 <span class="badge badge-${u.healthStatus}">${u.healthStatus}</span>
                             </div>
                         </div>
-                    `).join('') || '<div class="empty-state"><div class="empty-state-icon">🔌</div><div class="empty-state-title">暂无上游</div><p>前往「上游管理」添加 Emby 服务器</p></div>'}
+                    `).join('') || '<div class="empty-state"><div class="empty-state-icon">空</div><div class="empty-state-title">暂无上游</div><p>还没有添加任何 Emby 上游。</p></div>'}
                 </div>
             </div>
 
             <div style="margin-top:24px; padding:16px; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-md);">
                 <p style="color:var(--text-secondary); font-size:13px">
-                    📡 <strong>Emby 客户端连接地址：</strong>
+                    <strong>Emby 客户端接入地址</strong>
                     <code style="color:var(--accent-light); background:var(--bg-input); padding:2px 8px; border-radius:4px">
                         http://服务器IP:${status.port || 8096}
                     </code>
@@ -189,50 +252,50 @@ async function renderDashboard(el) {
             </div>
         `;
     } catch (err) {
-        el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">⚠️</div><div class="empty-state-title">加载失败</div><p>${esc(err.message)}</p></div>`;
+        el.innerHTML = `<div class="empty-state"><div class="empty-state-icon">!</div><div class="empty-state-title">加载失败</div><p>${esc(err.message)}</p></div>`;
     }
 }
 
-// ── 上游管理 ──
 async function renderUpstreams(el) {
     const upstreams = await api('GET', '/upstreams').catch(() => []);
+    currentUpstreams = upstreams;
 
     el.innerHTML = `
-        <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
             <div>
                 <h1 class="page-title">上游管理</h1>
-                <p class="page-desc">管理 Emby 上游服务器</p>
+                <p class="page-desc">添加 Emby 上游，并配置播放模式、转发方式和请求伪装。</p>
             </div>
             <button class="btn btn-primary" id="add-upstream-btn">+ 添加上游</button>
         </div>
 
         <div class="upstream-list" id="upstream-list">
-            ${upstreams.map(u => upstreamCardHTML(u)).join('') ||
-              '<div class="empty-state"><div class="empty-state-icon">🔌</div><div class="empty-state-title">暂无上游服务器</div><p>点击右上角按钮添加你的第一台 Emby 服务器</p></div>'}
+            ${upstreams.map(u => upstreamCardHTML(u)).join('') || '<div class="empty-state"><div class="empty-state-icon">空</div><div class="empty-state-title">暂无上游配置</div><p>请先添加至少一个 Emby 上游。</p></div>'}
         </div>
     `;
 
-    document.getElementById('add-upstream-btn').onclick = () => showAddUpstreamModal();
-
-    // 绑定操作按钮
+    document.getElementById('add-upstream-btn').onclick = () => showUpstreamModal();
     el.querySelectorAll('[data-action]').forEach(btn => {
-        btn.onclick = () => handleUpstreamAction(btn.dataset.action, parseInt(btn.dataset.id));
+        btn.onclick = () => handleUpstreamAction(btn.dataset.action, parseInt(btn.dataset.id, 10));
     });
 }
 
 function upstreamCardHTML(u) {
+    const spoofMode = normalizeSpoofMode(u.spoofMode);
     return `
         <div class="upstream-card" id="upstream-${u.id}">
             <div class="status-dot ${u.healthStatus}"></div>
             <div class="upstream-info">
                 <div class="upstream-name">${esc(u.name)}</div>
                 <div class="upstream-url">${esc(u.url)}</div>
+                <div class="upstream-url">账号：${esc(u.username || '未设置')} · 流地址：${esc(u.streamingURL || '未设置')}</div>
             </div>
             <div class="upstream-meta">
-                <span class="badge badge-${u.playbackMode || 'proxy'}">${u.playbackMode || 'proxy'}</span>
-                <span class="badge badge-${u.spoofMode || 'infuse'}">${u.spoofMode || 'infuse'}</span>
+                <span class="badge badge-${playbackBadgeClass(u)}">${esc(playbackBadgeText(u))}</span>
+                <span class="badge badge-${spoofMode}">${esc(spoofText(spoofMode))}</span>
             </div>
             <div class="upstream-actions">
+                <button class="btn btn-secondary btn-sm" data-action="edit" data-id="${u.id}">编辑</button>
                 <button class="btn btn-secondary btn-sm" data-action="test" data-id="${u.id}">测试</button>
                 <button class="btn btn-secondary btn-sm" data-action="reconnect" data-id="${u.id}">重连</button>
                 <button class="btn btn-danger btn-sm" data-action="delete" data-id="${u.id}">删除</button>
@@ -242,94 +305,146 @@ function upstreamCardHTML(u) {
 }
 
 async function handleUpstreamAction(action, id) {
+    if (action === 'edit') {
+        const upstream = currentUpstreams.find(item => item.id === id);
+        if (!upstream) {
+            toast('未找到对应上游', 'error');
+            return;
+        }
+        showUpstreamModal(upstream);
+        return;
+    }
+
     if (action === 'delete') {
-        if (!confirm('确定删除此上游？关联的 ID 映射也会被清除。')) return;
+        if (!confirm('确定删除这个上游吗？已生成的 ID 映射不会自动删除。')) return;
         await api('DELETE', `/upstreams/${id}`);
         toast('上游已删除', 'success');
         renderUpstreams(document.getElementById('content'));
-    } else if (action === 'reconnect') {
+        return;
+    }
+
+    if (action === 'reconnect') {
         await api('POST', `/upstreams/${id}/reconnect`);
-        toast('正在重新连接...', 'info');
-    } else if (action === 'test') {
-        toast('正在测试连通性...', 'info');
+        toast('正在重连上游...', 'info');
+        return;
+    }
+
+    if (action === 'test') {
+        toast('正在测试上游...', 'info');
         const result = await api('POST', `/upstreams/${id}/test`);
-        toast(result.online ? `✅ 在线: ${result.message}` : `❌ 离线: ${result.message}`,
-              result.online ? 'success' : 'error');
+        toast(result.online ? `连接成功：${result.message}` : `连接失败：${result.message}`, result.online ? 'success' : 'error');
     }
 }
 
 function showAddUpstreamModal() {
+    showUpstreamModal();
+}
+
+function showUpstreamModal(upstream = null) {
+    const isEdit = Boolean(upstream);
     const modal = document.getElementById('modal-content');
+    const playbackValue = normalizePlaybackChoice(upstream);
+    const spoofValue = normalizeSpoofMode(upstream?.spoofMode);
+    const passwordHint = isEdit && upstream?.hasPassword ? '留空则保持当前密码' : '选填';
+    const apiKeyHint = isEdit && upstream?.hasAPIKey ? '留空则保持当前 API Key' : 'Emby API Key';
+
     modal.innerHTML = `
-        <div class="modal-title">添加上游 Emby 服务器</div>
-        <form id="add-upstream-form" style="display:flex;flex-direction:column;gap:16px">
+        <div class="modal-title">${isEdit ? '编辑 Emby 上游' : '添加 Emby 上游'}</div>
+        <form id="upstream-form" style="display:flex;flex-direction:column;gap:16px">
             <div class="form-group">
-                <label>服务器名称</label>
-                <input type="text" id="up-name" placeholder="例如：主力站 / 日剧站" required>
+                <label>名称</label>
+                <input type="text" id="up-name" placeholder="例如主服 / 影院服" value="${esc(upstream?.name || '')}" required>
             </div>
             <div class="form-group">
-                <label>服务器地址</label>
-                <input type="url" id="up-url" placeholder="https://emby.example.com" required>
+                <label>地址</label>
+                <input type="url" id="up-url" placeholder="https://emby.example.com" value="${esc(upstream?.url || '')}" required>
             </div>
             <div class="form-group">
-                <label>用户名 (与 API Key 二选一)</label>
-                <input type="text" id="up-username" placeholder="用户名">
+                <label>用户名（可留空，使用 API Key 也可以）</label>
+                <input type="text" id="up-username" placeholder="用户名" value="${esc(upstream?.username || '')}">
             </div>
             <div class="form-group">
                 <label>密码</label>
-                <input type="password" id="up-password" placeholder="密码">
+                <input type="password" id="up-password" placeholder="${passwordHint}">
+                <div class="field-help">${passwordHint}</div>
             </div>
             <div class="form-group">
-                <label>API Key (与用户名密码二选一)</label>
-                <input type="text" id="up-apikey" placeholder="Emby API Key">
+                <label>API Key（可选，用于无需账号密码时）</label>
+                <input type="text" id="up-apikey" placeholder="${apiKeyHint}">
+                <div class="field-help">${apiKeyHint}</div>
+            </div>
+            <div class="form-group">
+                <label>独立流媒体地址（可选）</label>
+                <input type="url" id="up-streaming" placeholder="https://stream.example.com" value="${esc(upstream?.streamingURL || '')}">
+                <div class="field-help">仅在 302 直连模式下用于替换对外返回的播放地址。</div>
             </div>
             <div class="form-group">
                 <label>播放模式</label>
-                <select id="up-playback">
-                    <option value="proxy">Proxy (流量中转)</option>
-                    <option value="redirect">Redirect (302 跳转)</option>
-                </select>
+                <select id="up-playback">${renderOptions(PLAYBACK_OPTIONS, playbackValue)}</select>
+                <div class="field-help">继承表示使用全局默认播放模式；只有单独指定时才覆盖全局。</div>
             </div>
             <div class="form-group">
                 <label>UA 伪装</label>
-                <select id="up-spoof">
-                    <option value="infuse">Infuse (推荐)</option>
-                    <option value="none">无伪装</option>
-                    <option value="passthrough">透传客户端</option>
-                    <option value="custom">自定义</option>
-                </select>
+                <select id="up-spoof">${renderOptions(SPOOF_OPTIONS, spoofValue)}</select>
+                <div class="field-help">保留 Infuse、Web、客户端三种模板，用于真实伪装常见终端请求头。</div>
             </div>
+            ${isEdit ? `
+                <div class="form-group">
+                    <label>启用状态</label>
+                    <select id="up-enabled">
+                        <option value="true" ${upstream?.enabled !== false ? 'selected' : ''}>启用</option>
+                        <option value="false" ${upstream?.enabled === false ? 'selected' : ''}>停用</option>
+                    </select>
+                </div>
+            ` : ''}
             <div class="modal-actions">
                 <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
-                <button type="submit" class="btn btn-primary">添加</button>
+                <button type="submit" class="btn btn-primary">${isEdit ? '保存修改' : '添加上游'}</button>
             </div>
         </form>
     `;
 
-    document.getElementById('add-upstream-form').onsubmit = async (e) => {
+    document.getElementById('upstream-form').onsubmit = async (e) => {
         e.preventDefault();
+        const payload = {
+            name: document.getElementById('up-name').value.trim(),
+            url: document.getElementById('up-url').value.trim(),
+            username: document.getElementById('up-username').value.trim(),
+            playbackMode: document.getElementById('up-playback').value,
+            spoofMode: document.getElementById('up-spoof').value,
+            streamingURL: document.getElementById('up-streaming').value.trim(),
+        };
+
+        const password = document.getElementById('up-password').value;
+        const apiKey = document.getElementById('up-apikey').value.trim();
+        if (password || !isEdit || !upstream?.hasPassword) {
+            payload.password = password;
+        }
+        if (apiKey || !isEdit || !upstream?.hasAPIKey) {
+            payload.apiKey = apiKey;
+        }
+        if (isEdit) {
+            payload.enabled = document.getElementById('up-enabled').value === 'true';
+        }
+
         try {
-            await api('POST', '/upstreams', {
-                name: document.getElementById('up-name').value,
-                url: document.getElementById('up-url').value,
-                username: document.getElementById('up-username').value,
-                password: document.getElementById('up-password').value,
-                apiKey: document.getElementById('up-apikey').value,
-                playbackMode: document.getElementById('up-playback').value,
-                spoofMode: document.getElementById('up-spoof').value,
-            });
+            if (isEdit) {
+                await api('PUT', `/upstreams/${upstream.id}`, payload);
+                toast('上游已更新', 'success');
+            } else {
+                await api('POST', '/upstreams', payload);
+                toast('上游已添加，正在进行连通性检查...', 'success');
+            }
             closeModal();
-            toast('上游添加成功！正在认证...', 'success');
             renderUpstreams(document.getElementById('content'));
         } catch (err) {
-            toast('添加失败: ' + err.message, 'error');
+            toast((isEdit ? '更新失败：' : '添加失败：') + err.message, 'error');
         }
     };
 
     openModal();
 }
 
-// ── 流量监控 ──
 async function renderTraffic(el) {
     const data = await api('GET', '/traffic').catch(() => ({ current: [], total: {}, recent: [] }));
 
@@ -481,39 +596,45 @@ async function renderSettings(el) {
     el.innerHTML = `
         <div class="page-header">
             <h1 class="page-title">设置</h1>
-            <p class="page-desc">全局配置</p>
+            <p class="page-desc">修改服务名称、默认播放模式和管理员信息。</p>
         </div>
 
         <div class="card">
             <div class="settings-section">
-                <h3>服务器</h3>
+                <h3>服务</h3>
                 <div class="settings-row">
-                    <div class="settings-label">服务器名称</div>
-                    <input type="text" id="set-name" value="${esc(settings.serverName || 'FusionRide')}">
+                    <div class="settings-label">服务名称</div>
+                    <div>
+                        <input type="text" id="set-name" value="${esc(settings.serverName || 'FusionRide')}">
+                    </div>
                 </div>
                 <div class="settings-row">
                     <div class="settings-label">端口</div>
-                    <input type="number" id="set-port" value="${settings.port || 8096}" disabled>
-                    <div class="settings-help">端口修改需要重启生效</div>
+                    <div>
+                        <input type="number" id="set-port" value="${settings.port || 8096}" disabled>
+                        <div class="settings-help">端口由配置文件控制，当前页面不允许直接修改。</div>
+                    </div>
                 </div>
             </div>
 
             <div class="settings-section">
                 <h3>播放</h3>
                 <div class="settings-row">
-                    <div class="settings-label">全局播放模式</div>
-                    <select id="set-playback">
-                        <option value="proxy" ${settings.playbackMode === 'proxy' ? 'selected' : ''}>Proxy (流量中转)</option>
-                        <option value="redirect" ${settings.playbackMode === 'redirect' ? 'selected' : ''}>Redirect (302 跳转)</option>
-                    </select>
+                    <div class="settings-label">全局默认播放模式</div>
+                    <div>
+                        <select id="set-playback">${renderOptions(GLOBAL_PLAYBACK_OPTIONS, settings.playbackMode || 'proxy')}</select>
+                        <div class="settings-help">当上游未单独指定播放模式时，统一使用这里的设置。</div>
+                    </div>
                 </div>
             </div>
 
             <div class="settings-section">
                 <h3>安全</h3>
                 <div class="settings-row">
-                    <div class="settings-label">修改密码</div>
-                    <button class="btn btn-secondary btn-sm" id="change-pwd-btn">修改管理员密码</button>
+                    <div class="settings-label">管理员密码</div>
+                    <div>
+                        <button class="btn btn-secondary btn-sm" id="change-pwd-btn">修改管理员密码</button>
+                    </div>
                 </div>
             </div>
 
@@ -531,7 +652,7 @@ async function renderSettings(el) {
             });
             toast('设置已保存', 'success');
         } catch (err) {
-            toast('保存失败: ' + err.message, 'error');
+            toast('保存失败：' + err.message, 'error');
         }
     };
 
@@ -541,7 +662,7 @@ async function renderSettings(el) {
             <div class="modal-title">修改管理员密码</div>
             <form id="pwd-form" style="display:flex;flex-direction:column;gap:16px">
                 <div class="form-group">
-                    <label>当前密码</label>
+                    <label>旧密码</label>
                     <input type="password" id="pwd-old" required>
                 </div>
                 <div class="form-group">
@@ -550,7 +671,7 @@ async function renderSettings(el) {
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
-                    <button type="submit" class="btn btn-primary">确认修改</button>
+                    <button type="submit" class="btn btn-primary">更新密码</button>
                 </div>
             </form>
         `;
@@ -562,16 +683,15 @@ async function renderSettings(el) {
                     newPassword: document.getElementById('pwd-new').value,
                 });
                 closeModal();
-                toast('密码已修改', 'success');
+                toast('密码已更新', 'success');
             } catch (err) {
-                toast('修改失败: ' + err.message, 'error');
+                toast('修改失败：' + err.message, 'error');
             }
         };
         openModal();
     };
 }
 
-// ── SSE ──
 function connectSSE() {
     if (sseSource) sseSource.close();
     sseSource = new EventSource(API + '/traffic/stream?token=' + token);
@@ -604,13 +724,21 @@ async function api(method, path, body) {
     if (body) opts.body = JSON.stringify(body);
 
     const resp = await fetch(API + path, opts);
-    const data = await resp.json();
+    const raw = await resp.text();
+    let data = {};
+
+    if (raw) {
+        try {
+            data = JSON.parse(raw);
+        } catch (err) {
+            data = { error: raw };
+        }
+    }
 
     if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
     return data;
 }
 
-// ── UI 工具 ──
 function toast(msg, type = 'info') {
     const container = document.getElementById('toast-container');
     const el = document.createElement('div');

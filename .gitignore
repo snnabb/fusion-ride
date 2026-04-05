@@ -6,10 +6,17 @@
 *.dylib
 fusionride
 fusionride-*
+deploy.go
+deploy.exe
+deploy_win.exe
 
 # Database & Configs
 data/
 config/config.yaml
+
+# Worktrees
+.worktrees/
+worktrees/
 
 # OS Specific
 .DS_Store

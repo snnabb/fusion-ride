@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/fusionride/fusion-ride/internal/db"
+	"github.com/snnabb/fusion-ride/internal/db"
 )
 
 // Meter 提供 per-upstream 流量计量。

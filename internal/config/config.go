@@ -9,7 +9,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config 是 FusionRide 的顶层配置。
+var defaultCodecPriority = []string{"hevc", "av1", "h264"}
+
 type Config struct {
 	mu sync.RWMutex
 
@@ -34,7 +35,7 @@ type AdminConfig struct {
 }
 
 type PlaybackConfig struct {
-	Mode string `yaml:"mode"` // "proxy" | "redirect"
+	Mode string `yaml:"mode"`
 }
 
 type TimeoutConfig struct {
@@ -76,12 +77,12 @@ type UpstreamDef struct {
 	FollowRedirects  bool   `yaml:"followRedirects"`
 }
 
-// Default 返回一份合理的默认配置。
 func Default() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Port: 8096,
 			Name: "FusionRide",
+			ID:   "fusionride",
 		},
 		Admin: AdminConfig{
 			Username: "admin",
@@ -98,12 +99,13 @@ func Default() *Config {
 		},
 		Bitrate: BitrateConfig{
 			PreferHighest: true,
-			CodecPriority: []string{"hevc", "av1", "h264"},
+			CodecPriority: append([]string(nil), defaultCodecPriority...),
 		},
+		Proxies:  []ProxyConfig{},
+		Upstream: []UpstreamDef{},
 	}
 }
 
-// Load 从 YAML 文件加载配置，缺失字段使用默认值。
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
@@ -116,72 +118,111 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
-	cfg.validate()
+	cfg.Validate()
 	return cfg, nil
 }
 
-// Save 以原子写入方式保存配置到文件。
 func (c *Config) Save(path string) error {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	data, err := yaml.Marshal(c)
+	data, err := yaml.Marshal(c.snapshotLocked())
+	c.mu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("序列化配置失败: %w", err)
 	}
 
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("创建配置目录失败: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("写入临时文件失败: %w", err)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return fmt.Errorf("写入配置文件失败: %w", err)
 	}
 
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("保存配置文件失败: %w", err)
+	}
+
+	return nil
 }
 
-// UpdateFunc 以线程安全的方式更新配置。
 func (c *Config) UpdateFunc(fn func(cfg *Config)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	fn(c)
+	c.validateLocked()
 }
 
-// Snapshot 返回配置的只读副本。
-func (c *Config) Snapshot() Config {
+func (c *Config) Validate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.validateLocked()
+}
+
+func (c *Config) Snapshot() *Config {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	cp := *c
-	cp.Upstream = make([]UpstreamDef, len(c.Upstream))
-	copy(cp.Upstream, c.Upstream)
-	cp.Proxies = make([]ProxyConfig, len(c.Proxies))
-	copy(cp.Proxies, c.Proxies)
-	return cp
+	return c.snapshotLocked()
 }
 
-func (c *Config) validate() {
+func (c *Config) snapshotLocked() *Config {
+	snapshot := &Config{
+		Server:   c.Server,
+		Admin:    c.Admin,
+		Playback: c.Playback,
+		Timeouts: c.Timeouts,
+		Bitrate: BitrateConfig{
+			PreferHighest: c.Bitrate.PreferHighest,
+			CodecPriority: append([]string(nil), c.Bitrate.CodecPriority...),
+		},
+		Proxies:  append([]ProxyConfig(nil), c.Proxies...),
+		Upstream: append([]UpstreamDef(nil), c.Upstream...),
+	}
+	return snapshot
+}
+
+func (c *Config) validateLocked() {
 	if c.Server.Port <= 0 || c.Server.Port > 65535 {
 		c.Server.Port = 8096
 	}
 	if c.Server.Name == "" {
 		c.Server.Name = "FusionRide"
 	}
+	if c.Server.ID == "" {
+		c.Server.ID = "fusionride"
+	}
+	if c.Admin.Username == "" {
+		c.Admin.Username = "admin"
+	}
 	if c.Playback.Mode == "" {
 		c.Playback.Mode = "proxy"
 	}
+
 	if c.Timeouts.API <= 0 {
 		c.Timeouts.API = 30000
 	}
 	if c.Timeouts.Aggregate <= 0 {
 		c.Timeouts.Aggregate = 15000
 	}
+	if c.Timeouts.Login <= 0 {
+		c.Timeouts.Login = 10000
+	}
+	if c.Timeouts.HealthCheck <= 0 {
+		c.Timeouts.HealthCheck = 10000
+	}
 	if c.Timeouts.HealthInterval <= 0 {
 		c.Timeouts.HealthInterval = 60000
 	}
+
 	if len(c.Bitrate.CodecPriority) == 0 {
-		c.Bitrate.CodecPriority = []string{"hevc", "av1", "h264"}
+		c.Bitrate.CodecPriority = append([]string(nil), defaultCodecPriority...)
+	}
+	if c.Proxies == nil {
+		c.Proxies = []ProxyConfig{}
+	}
+	if c.Upstream == nil {
+		c.Upstream = []UpstreamDef{}
 	}
 }
