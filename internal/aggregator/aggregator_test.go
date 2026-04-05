@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,5 +260,94 @@ func TestVirtualizeItemUsesStructuredJSONWalk(t *testing.T) {
 	}
 	if got := parsed["Overview"]; got != "literal item-1 should stay" {
 		t.Fatalf("expected Overview string to stay unchanged, got %v", got)
+	}
+}
+
+func TestAggregateItemsRewritesVirtualPathPerUpstream(t *testing.T) {
+	paths := map[string]string{}
+	serverA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths["a"] = r.URL.RequestURI()
+		_ = json.NewEncoder(w).Encode(EmbyItemsResponse{})
+	}))
+	defer serverA.Close()
+
+	serverB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths["b"] = r.URL.RequestURI()
+		_ = json.NewEncoder(w).Encode(EmbyItemsResponse{})
+	}))
+	defer serverB.Close()
+
+	database := openAggregatorTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'infuse', 1, 'online', 'token-a')
+	`, 1, "emby-a", serverA.URL)
+	if err != nil {
+		t.Fatalf("insert upstream a failed: %v", err)
+	}
+	_, err = database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'infuse', 1, 'online', 'token-b')
+	`, 2, "emby-b", serverB.URL)
+	if err != nil {
+		t.Fatalf("insert upstream b failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	virtualSeriesID := store.GetOrCreate("series-a", 1, "Series")
+	if err := store.AddInstance(virtualSeriesID, "series-b", 2, 0); err != nil {
+		t.Fatalf("add series instance failed: %v", err)
+	}
+
+	agg := New(manager, store, logger.New(""), time.Second, nil)
+	if _, err := agg.AggregateItems(context.Background(), "/Shows/"+virtualSeriesID+"/Episodes"); err != nil {
+		t.Fatalf("AggregateItems failed: %v", err)
+	}
+
+	if paths["a"] != "/Shows/series-a/Episodes" {
+		t.Fatalf("expected upstream a path to be rewritten, got %q", paths["a"])
+	}
+	if paths["b"] != "/Shows/series-b/Episodes" {
+		t.Fatalf("expected upstream b path to be rewritten, got %q", paths["b"])
+	}
+}
+
+func TestAggregateItemsRewritesUserPathToUpstreamUserID(t *testing.T) {
+	var captured []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = append(captured, r.URL.RequestURI())
+		_ = json.NewEncoder(w).Encode(EmbyItemsResponse{})
+	}))
+	defer server.Close()
+
+	database := openAggregatorTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'infuse', 1, 'online', 'token')
+	`, 1, "emby-a", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	selected := manager.ByID(1)
+	selected.Mu.Lock()
+	selected.Session = &auth.UpstreamSession{
+		ServerID: 1,
+		Token:    "token",
+		UserID:   "user-123",
+	}
+	selected.Mu.Unlock()
+
+	store := idmap.NewStore(database)
+	agg := New(manager, store, logger.New(""), time.Second, nil)
+
+	if _, err := agg.AggregateItems(context.Background(), "/Users/ffffffffffffffffffffffffffffffff/Items/Latest"); err != nil {
+		t.Fatalf("AggregateItems failed: %v", err)
+	}
+
+	if len(captured) != 1 || !strings.Contains(captured[0], "/Users/user-123/Items/Latest") {
+		t.Fatalf("expected aggregate path to use upstream user id, got %v", captured)
 	}
 }

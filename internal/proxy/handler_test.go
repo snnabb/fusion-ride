@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -357,5 +358,217 @@ func TestSessionCleanupRemovesExpiredEntriesAndRefreshesAccess(t *testing.T) {
 	}
 	if _, ok := handler.lookupSession("fresh-token"); !ok {
 		t.Fatal("expected fresh token to remain after cleanup")
+	}
+}
+
+func TestHandlePlaybackInfoRoutesToOwningUpstreamAndStoresPlaySession(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.RequestURI()
+		defer r.Body.Close()
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"MediaSources": []map[string]any{{
+				"Id":     "media-1",
+				"ItemId": "item-original",
+			}},
+			"PlaySessionId": "play-1",
+		})
+	}))
+	defer server.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'web', 1, 'online', 'token')
+	`, 2, "emby-b", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	cfg.Server.ID = "fusionride"
+	handler := NewHandler(cfg, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	virtualID := store.GetOrCreate("item-original", 2, "Movie")
+	req := httptest.NewRequest(http.MethodPost, "/emby/Items/"+virtualID+"/PlaybackInfo", strings.NewReader(`{"ItemId":"`+virtualID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected playback info 200, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if capturedPath != "/emby/Items/item-original/PlaybackInfo" {
+		t.Fatalf("expected playback info path to be devirtualized, got %q", capturedPath)
+	}
+	if got := capturedBody["ItemId"]; got != "item-original" {
+		t.Fatalf("expected playback info body item id to be devirtualized, got %v", got)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal playback info failed: %v", err)
+	}
+	mediaSources := payload["MediaSources"].([]any)
+	if mediaSources[0].(map[string]any)["ItemId"] != virtualID {
+		t.Fatalf("expected playback info response item id to be virtualized, got %v", mediaSources[0].(map[string]any)["ItemId"])
+	}
+	if session, ok := handler.lookupPlaybackSession("play-1"); !ok || session.UpstreamID != 2 {
+		t.Fatalf("expected playback session to be recorded for upstream 2, got %#v, ok=%v", session, ok)
+	}
+}
+
+func TestHandlePlaybackReportUsesRecordedUpstreamAndDevirtualizesBody(t *testing.T) {
+	var called bool
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		defer r.Body.Close()
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'web', 1, 'online', 'token')
+	`, 2, "emby-b", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	handler := NewHandler(config.Default(), manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	virtualID := store.GetOrCreate("item-original", 2, "Movie")
+	handler.rememberPlaybackSession("play-1", playbackSession{
+		UpstreamID:     2,
+		OriginalItemID: "item-original",
+		VirtualItemID:  virtualID,
+		lastAccess:     time.Now(),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/emby/Sessions/Playing/Progress", strings.NewReader(`{"PlaySessionId":"play-1","ItemId":"`+virtualID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("expected playback report 204, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if !called {
+		t.Fatal("expected playback report to be forwarded to recorded upstream")
+	}
+	if got := capturedBody["ItemId"]; got != "item-original" {
+		t.Fatalf("expected playback report item id to be devirtualized, got %v", got)
+	}
+}
+
+func TestHandleFallbackVirtualizesJSONAndDevirtualizesRequestBody(t *testing.T) {
+	var capturedBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ItemId": "item-original",
+		})
+	}))
+	defer server.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'web', 1, 'online', 'session-token')
+	`, 2, "emby-b", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	handler := NewHandler(config.Default(), manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	virtualID := store.GetOrCreate("item-original", 2, "Movie")
+	handler.rememberSession("client-token", loginSession{
+		UpstreamID:     2,
+		UpstreamUserID: "user-2",
+		VirtualUserID:  "virtual-user",
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/emby/Favorites", strings.NewReader(`{"ItemId":"`+virtualID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Emby-Token", "client-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected fallback 200, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if got := capturedBody["ItemId"]; got != "item-original" {
+		t.Fatalf("expected fallback body item id to be devirtualized, got %v", got)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal fallback response failed: %v", err)
+	}
+	if payload["ItemId"] != virtualID {
+		t.Fatalf("expected fallback response item id to be virtualized, got %v", payload["ItemId"])
+	}
+}
+
+func TestHandleImageCachesSmallResponses(t *testing.T) {
+	requests := 0
+	imageBytes := []byte("small-image")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(imageBytes)
+	}))
+	defer server.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'web', 1, 'online', 'token')
+	`, 2, "emby-b", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	handler := NewHandler(config.Default(), manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	virtualID := store.GetOrCreate("item-original", 2, "Movie")
+	path := "/emby/Items/" + virtualID + "/Images/Primary"
+
+	firstReq := httptest.NewRequest(http.MethodGet, path, nil)
+	firstRec := httptest.NewRecorder()
+	handler.ServeHTTP(firstRec, firstReq)
+
+	secondReq := httptest.NewRequest(http.MethodGet, path, nil)
+	secondRec := httptest.NewRecorder()
+	handler.ServeHTTP(secondRec, secondReq)
+
+	if firstRec.Code != http.StatusOK || secondRec.Code != http.StatusOK {
+		t.Fatalf("expected image requests to succeed, got %d and %d", firstRec.Code, secondRec.Code)
+	}
+	if requests != 1 {
+		t.Fatalf("expected second image request to hit cache, got %d upstream requests", requests)
+	}
+	if !bytes.Equal(firstRec.Body.Bytes(), secondRec.Body.Bytes()) {
+		t.Fatal("expected cached image bytes to match original response")
 	}
 }

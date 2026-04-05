@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -88,11 +89,16 @@ func (a *Aggregator) AggregateItems(ctx context.Context, path string) ([]byte, e
 	var wg sync.WaitGroup
 
 	for _, upstreamInstance := range onlineUpstreams {
+		upstreamPath, ok := a.rewritePathForUpstream(path, upstreamInstance)
+		if !ok {
+			continue
+		}
+
 		wg.Add(1)
-		go func(upstreamInstance *upstream.Upstream) {
+		go func(upstreamInstance *upstream.Upstream, upstreamPath string) {
 			defer wg.Done()
 
-			resp, err := upstreamInstance.DoAPI(ctx, "GET", path, nil)
+			resp, err := upstreamInstance.DoAPI(ctx, http.MethodGet, upstreamPath, nil)
 			if err != nil {
 				select {
 				case results <- result{serverID: upstreamInstance.ID, err: err}:
@@ -115,7 +121,7 @@ func (a *Aggregator) AggregateItems(ctx context.Context, path string) ([]byte, e
 			case results <- result{items: a.parseItems(body, upstreamInstance.ID), serverID: upstreamInstance.ID}:
 			case <-ctx.Done():
 			}
-		}(upstreamInstance)
+		}(upstreamInstance, upstreamPath)
 	}
 
 	go func() {
@@ -160,11 +166,16 @@ func (a *Aggregator) AggregateSearch(ctx context.Context, path string) ([]byte, 
 	var wg sync.WaitGroup
 
 	for _, upstreamInstance := range onlineUpstreams {
+		upstreamPath, ok := a.rewritePathForUpstream(path, upstreamInstance)
+		if !ok {
+			continue
+		}
+
 		wg.Add(1)
-		go func(upstreamInstance *upstream.Upstream) {
+		go func(upstreamInstance *upstream.Upstream, upstreamPath string) {
 			defer wg.Done()
 
-			resp, err := upstreamInstance.DoAPI(ctx, "GET", path, nil)
+			resp, err := upstreamInstance.DoAPI(ctx, http.MethodGet, upstreamPath, nil)
 			if err != nil {
 				select {
 				case results <- searchResult{serverID: upstreamInstance.ID, err: err}:
@@ -195,7 +206,7 @@ func (a *Aggregator) AggregateSearch(ctx context.Context, path string) ([]byte, 
 			case results <- searchResult{hints: parsed.SearchHints, serverID: upstreamInstance.ID}:
 			case <-ctx.Done():
 			}
-		}(upstreamInstance)
+		}(upstreamInstance, upstreamPath)
 	}
 
 	go func() {
@@ -245,9 +256,9 @@ func (a *Aggregator) AggregateSingleItem(ctx context.Context, virtualID string) 
 		err  error
 	)
 	if userID == "" {
-		resp, err = selected.DoAPI(ctx, "GET", fmt.Sprintf("/Items/%s?Fields=MediaSources,ProviderIds", originalID), nil)
+		resp, err = selected.DoAPI(ctx, http.MethodGet, fmt.Sprintf("/Items/%s?Fields=MediaSources,ProviderIds", originalID), nil)
 	} else {
-		resp, err = selected.DoAPI(ctx, "GET", fmt.Sprintf("/Users/%s/Items/%s", userID, originalID), nil)
+		resp, err = selected.DoAPI(ctx, http.MethodGet, fmt.Sprintf("/Users/%s/Items/%s", userID, originalID), nil)
 	}
 	if err != nil {
 		return nil, err
@@ -464,7 +475,7 @@ func (a *Aggregator) virtualizeItem(item EmbyItem) json.RawMessage {
 		return item.Raw
 	}
 
-	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId"}, item.ServerID, a.idStore)
+	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId", "ItemId"}, item.ServerID, a.idStore)
 
 	result, err := json.Marshal(parsed)
 	if err != nil {
@@ -479,7 +490,7 @@ func (a *Aggregator) virtualizeRawItem(raw json.RawMessage, serverID int) json.R
 		return raw
 	}
 
-	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId"}, serverID, a.idStore)
+	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId", "ItemId"}, serverID, a.idStore)
 
 	result, err := json.Marshal(parsed)
 	if err != nil {
@@ -494,7 +505,7 @@ func (a *Aggregator) virtualizeRawBytes(data []byte, serverID int) []byte {
 		return data
 	}
 
-	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId"}, serverID, a.idStore)
+	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId", "ItemId"}, serverID, a.idStore)
 
 	result, err := json.Marshal(parsed)
 	if err != nil {
@@ -521,7 +532,7 @@ func (a *Aggregator) mergeMediaSources(ctx context.Context, mainBody []byte, ins
 			continue
 		}
 
-		resp, err := upstreamInstance.DoAPI(ctx, "GET", fmt.Sprintf("/Items/%s", instance.OriginalID), nil)
+		resp, err := upstreamInstance.DoAPI(ctx, http.MethodGet, fmt.Sprintf("/Items/%s", instance.OriginalID), nil)
 		if err != nil {
 			continue
 		}
@@ -540,6 +551,53 @@ func (a *Aggregator) mergeMediaSources(ctx context.Context, mainBody []byte, ins
 	mainParsed["MediaSources"] = existingSources
 	result, _ := json.Marshal(mainParsed)
 	return result
+}
+
+func (a *Aggregator) rewritePathForUpstream(rawPath string, upstreamInstance *upstream.Upstream) (string, bool) {
+	parsed, err := url.ParseRequestURI(rawPath)
+	if err != nil {
+		return rawPath, true
+	}
+
+	segments := strings.Split(parsed.Path, "/")
+	if len(segments) > 2 && segments[1] == "Users" {
+		if userID := upstreamInstance.GetUserID(); userID != "" {
+			segments[2] = userID
+		}
+	}
+
+	for i, segment := range segments {
+		if !isLikelyVirtualID(segment) {
+			continue
+		}
+
+		originalID, ok := a.originalIDForUpstream(segment, upstreamInstance.ID)
+		if !ok {
+			return "", false
+		}
+		segments[i] = originalID
+	}
+
+	parsed.Path = strings.Join(segments, "/")
+	return parsed.RequestURI(), true
+}
+
+func (a *Aggregator) originalIDForUpstream(virtualID string, upstreamID int) (string, bool) {
+	originalID, serverID, ok := a.idStore.Resolve(virtualID)
+	if !ok {
+		return "", false
+	}
+	if serverID == upstreamID {
+		return originalID, true
+	}
+
+	for _, instance := range a.idStore.GetInstances(virtualID) {
+		if instance.ServerID == upstreamID {
+			return instance.OriginalID, true
+		}
+	}
+
+	return "", false
 }
 
 func containsChinese(s string) bool {
@@ -577,4 +635,16 @@ func walkAndVirtualize(data any, idFields []string, serverID int, store *idmap.S
 			walkAndVirtualize(value, idFields, serverID, store)
 		}
 	}
+}
+
+func isLikelyVirtualID(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
 }
