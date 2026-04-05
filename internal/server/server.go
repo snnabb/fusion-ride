@@ -45,6 +45,11 @@ func New(cfg *config.Config, cfgPath string, database *db.DB, log *logger.Logger
 
 func (s *Server) Start(ctx context.Context) error {
 	adminAuth := auth.NewAdminAuth(s.db, "")
+	if adminAuth.NeedsSetup() && strings.TrimSpace(s.cfg.Admin.Password) != "" {
+		if err := adminAuth.Setup(s.cfg.Admin.Username, s.cfg.Admin.Password); err != nil {
+			return fmt.Errorf("初始化管理员凭据失败: %w", err)
+		}
+	}
 	s.upMgr = upstream.NewManager(s.db, s.log, s.cfg.Playback.Mode)
 	ids := idmap.NewStore(s.db)
 
@@ -58,7 +63,7 @@ func (s *Server) Start(ctx context.Context) error {
 		time.Duration(s.cfg.Timeouts.Aggregate)*time.Millisecond,
 		s.cfg.Bitrate.CodecPriority,
 	)
-	proxyHandler := proxy.NewHandler(s.cfg, s.db, s.upMgr, agg, ids, s.log, s.meter)
+	proxyHandler := proxy.NewHandler(s.cfg, s.db, s.upMgr, agg, ids, s.log, s.meter, adminAuth)
 	proxyHandler.StartSessionCleanup(ctx)
 
 	s.adminAPI = admin.NewAPI(s.cfg, s.cfgPath, adminAuth, s.upMgr, ids, s.log, s.meter)

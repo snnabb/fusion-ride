@@ -561,15 +561,7 @@ func (u *Upstream) DoAPIWithHeaders(ctx context.Context, method, path string, bo
 	}
 
 	copyForwardHeaders(req.Header, incoming)
-	if incoming != nil {
-		if token := strings.TrimSpace(incoming.Get("X-Emby-Token")); token != "" {
-			req.Header.Set("X-Emby-Token", token)
-		} else {
-			req.Header.Set("X-Emby-Token", session.Token)
-		}
-	} else {
-		req.Header.Set("X-Emby-Token", session.Token)
-	}
+	req.Header.Set("X-Emby-Token", session.Token)
 	if incoming != nil {
 		if auth := incoming.Get("Authorization"); auth != "" {
 			req.Header.Set("Authorization", auth)
@@ -661,6 +653,15 @@ func (u *Upstream) GetUserID() string {
 		return ""
 	}
 	return u.Session.UserID
+}
+
+func (u *Upstream) SetUserID(userID string) {
+	u.Mu.Lock()
+	defer u.Mu.Unlock()
+	if u.Session == nil {
+		return
+	}
+	u.Session.UserID = strings.TrimSpace(userID)
 }
 
 func (u *Upstream) BuildStreamURL(originalID string, query string) string {

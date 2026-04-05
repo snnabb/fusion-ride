@@ -28,7 +28,7 @@ func openManagerTestDB(t *testing.T) *db.DB {
 	return database
 }
 
-func TestDoAPIWithHeadersPrefersClientToken(t *testing.T) {
+func TestDoAPIWithHeadersUsesUpstreamSessionToken(t *testing.T) {
 	var captured http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		captured = r.Header.Clone()
@@ -55,8 +55,8 @@ func TestDoAPIWithHeadersPrefersClientToken(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if got := captured.Get("X-Emby-Token"); got != "client-token" {
-		t.Fatalf("expected client token to win, got %q", got)
+	if got := captured.Get("X-Emby-Token"); got != "session-token" {
+		t.Fatalf("expected upstream session token, got %q", got)
 	}
 	if got := captured.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Emby Web"`) {
 		t.Fatalf("expected spoofed authorization header, got %q", got)

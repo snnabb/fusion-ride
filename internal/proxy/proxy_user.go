@@ -29,6 +29,14 @@ func loadOrCreateProxyUserID(database *db.DB) string {
 }
 
 func generateProxyUserID() string {
+	return generateHexToken()
+}
+
+func generateSecureToken() string {
+	return generateHexToken()
+}
+
+func generateHexToken() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		return "00000000000000000000000000000000"

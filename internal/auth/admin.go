@@ -66,11 +66,20 @@ func (a *AdminAuth) Setup(username, password string) error {
 	return err
 }
 
+func (a *AdminAuth) VerifyCredentials(username, password string) bool {
+	storedUsername, storedHash, err := a.getCredentials()
+	if err != nil {
+		return false
+	}
+	if username != storedUsername {
+		return false
+	}
+	return a.checkPassword(password, storedHash)
+}
+
 // Login 验证管理员凭据，成功返回 JWT。
 func (a *AdminAuth) Login(username, password string) (string, error) {
-	var storedUsername, storedHash string
-	err := a.db.QueryRow(`SELECT username, password_hash FROM admin WHERE id = 1`).
-		Scan(&storedUsername, &storedHash)
+	storedUsername, storedHash, err := a.getCredentials()
 	if err != nil {
 		return "", fmt.Errorf("管理员未配置")
 	}
@@ -79,7 +88,7 @@ func (a *AdminAuth) Login(username, password string) (string, error) {
 		return "", fmt.Errorf("用户名或密码错误")
 	}
 
-	if !verifyPassword(password, storedHash) {
+	if !a.checkPassword(password, storedHash) {
 		return "", fmt.Errorf("用户名或密码错误")
 	}
 
@@ -93,12 +102,11 @@ func (a *AdminAuth) VerifyToken(token string) (string, error) {
 
 // ChangePassword 修改管理员密码。
 func (a *AdminAuth) ChangePassword(oldPwd, newPwd string) error {
-	var storedHash string
-	err := a.db.QueryRow(`SELECT password_hash FROM admin WHERE id = 1`).Scan(&storedHash)
+	_, storedHash, err := a.getCredentials()
 	if err != nil {
 		return fmt.Errorf("管理员未配置")
 	}
-	if !verifyPassword(oldPwd, storedHash) {
+	if !a.checkPassword(oldPwd, storedHash) {
 		return fmt.Errorf("旧密码错误")
 	}
 	hash, err := hashPassword(newPwd)
@@ -107,6 +115,20 @@ func (a *AdminAuth) ChangePassword(oldPwd, newPwd string) error {
 	}
 	_, err = a.db.Exec(`UPDATE admin SET password_hash = ? WHERE id = 1`, hash)
 	return err
+}
+
+func (a *AdminAuth) getCredentials() (string, string, error) {
+	var storedUsername, storedHash string
+	err := a.db.QueryRow(`SELECT username, password_hash FROM admin WHERE id = 1`).
+		Scan(&storedUsername, &storedHash)
+	if err != nil {
+		return "", "", err
+	}
+	return storedUsername, storedHash, nil
+}
+
+func (a *AdminAuth) checkPassword(password, storedHash string) bool {
+	return verifyPassword(password, storedHash)
 }
 
 // ── JWT ──

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/snnabb/fusion-ride/internal/aggregator"
+	"github.com/snnabb/fusion-ride/internal/auth"
 	"github.com/snnabb/fusion-ride/internal/config"
 	"github.com/snnabb/fusion-ride/internal/db"
 	"github.com/snnabb/fusion-ride/internal/idmap"
@@ -31,6 +32,16 @@ func openProxyTestDB(t *testing.T) *db.DB {
 		_ = database.Close()
 	})
 	return database
+}
+
+func setupProxyAdmin(t *testing.T, database *db.DB, username, password string) *auth.AdminAuth {
+	t.Helper()
+
+	adminAuth := auth.NewAdminAuth(database, "")
+	if err := adminAuth.Setup(username, password); err != nil {
+		t.Fatalf("setup proxy admin failed: %v", err)
+	}
+	return adminAuth
 }
 
 func TestNewHandlerPersistsStableProxyUserID(t *testing.T) {
@@ -106,16 +117,17 @@ func TestHandleLoginReturnsStableProxyUserID(t *testing.T) {
 		defer r.Body.Close()
 		body, _ := io.ReadAll(r.Body)
 		captured.Body = string(body)
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ServerId": "upstream-server",
-			"User": map[string]any{
-				"Id":   "upstream-user",
-				"Name": "demo",
-			},
-			"AccessToken": "client-token",
-		})
+		switch r.URL.Path {
+		case "/Users/upstream-user":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Id":       "upstream-user",
+				"Name":     "Proxy Admin",
+				"ServerId": "upstream-server",
+			})
+		default:
+			http.NotFound(w, r)
+		}
 	}))
 	defer upstreamServer.Close()
 
@@ -132,10 +144,21 @@ func TestHandleLoginReturnsStableProxyUserID(t *testing.T) {
 	store := idmap.NewStore(database)
 	cfg := config.Default()
 	cfg.Server.ID = "fusionride"
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
 
 	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	upstreamInstance := manager.ByID(1)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "session-token", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"demo","Pw":"secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"proxy-admin","Pw":"proxy-secret"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Emby-Authorization", `MediaBrowser Client="Legacy", Device="Old TV", DeviceId="old-device", Version="1.0.0"`)
 
@@ -145,23 +168,8 @@ func TestHandleLoginReturnsStableProxyUserID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d with body %s", rec.Code, rec.Body.String())
 	}
-	if captured.Body != `{"Username":"demo","Pw":"secret"}` {
-		t.Fatalf("expected upstream to receive original login body, got %q", captured.Body)
-	}
-	if got := captured.Header.Get("Content-Type"); got != "application/json" {
-		t.Fatalf("expected Content-Type to be forwarded, got %q", got)
-	}
-	if got := captured.Header.Get("X-Emby-Token"); got != "session-token" {
-		t.Fatalf("expected upstream session token, got %q", got)
-	}
-	if got := captured.Header.Get("User-Agent"); !strings.Contains(got, "Emby Theater") {
-		t.Fatalf("expected spoofed web User-Agent, got %q", got)
-	}
-	if got := captured.Header.Get("X-Emby-Authorization"); !strings.Contains(got, `Client="Emby Web"`) {
-		t.Fatalf("expected spoofed web authorization client, got %q", got)
-	}
-	if got := captured.Header.Get("X-Emby-Authorization"); !strings.Contains(got, `Version="4.9.0.42"`) {
-		t.Fatalf("expected spoofed web authorization version, got %q", got)
+	if captured.Body != "" {
+		t.Fatalf("expected login not to hit upstream auth endpoint, got %q", captured.Body)
 	}
 
 	var payload map[string]any
@@ -178,6 +186,17 @@ func TestHandleLoginReturnsStableProxyUserID(t *testing.T) {
 	if payload["ServerId"] != "fusionride" {
 		t.Fatalf("expected server id to be rewritten, got %q", payload["ServerId"])
 	}
+	token, _ := payload["AccessToken"].(string)
+	if token == "" || token == "session-token" {
+		t.Fatalf("expected proxy-issued token, got %q", token)
+	}
+	session, ok := handler.lookupSession(token)
+	if !ok {
+		t.Fatal("expected login session to be stored")
+	}
+	if session.UpstreamID != 1 || session.UpstreamUserID != "upstream-user" {
+		t.Fatalf("expected login session to bind upstream user, got %#v", session)
+	}
 }
 
 func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
@@ -186,16 +205,6 @@ func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
 		paths = append(paths, r.URL.Path)
 
 		switch r.URL.Path {
-		case "/Users/AuthenticateByName":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"AccessToken": "client-token",
-				"ServerId":    "upstream-server",
-				"User": map[string]any{
-					"Id":   "upstream-user",
-					"Name": "demo",
-				},
-			})
 		case "/Users/upstream-user":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -224,10 +233,21 @@ func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
 	store := idmap.NewStore(database)
 	cfg := config.Default()
 	cfg.Server.ID = "fusionride"
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
 	agg := aggregator.New(manager, store, logger.New(""), time.Second, nil)
 	handler := NewHandler(cfg, database, manager, agg, store, logger.New(""), traffic.NewMeter(database))
+	upstreamInstance := manager.ByID(1)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "session-token", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
 
-	loginReq := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"demo","Pw":"secret"}`))
+	loginReq := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"proxy-admin","Pw":"proxy-secret"}`))
 	loginReq.Header.Set("Content-Type", "application/json")
 	loginRec := httptest.NewRecorder()
 	handler.ServeHTTP(loginRec, loginReq)
@@ -253,8 +273,8 @@ func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d with body %s", rec.Code, rec.Body.String())
 	}
-	if strings.Join(paths, ",") != "/Users/AuthenticateByName,/Users/upstream-user" {
-		t.Fatalf("expected login plus /Users/{id} fallback, got %q", strings.Join(paths, ","))
+	if strings.Join(paths, ",") != "/Users/upstream-user" {
+		t.Fatalf("expected direct /Users/{id} fetch, got %q", strings.Join(paths, ","))
 	}
 
 	var payload map[string]any
@@ -446,104 +466,85 @@ func TestIsAggregatablePathExcludesUsersMe(t *testing.T) {
 	}
 }
 
-func TestHandleLoginTriesNextOnlineUpstream(t *testing.T) {
-	firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "bad credentials", http.StatusUnauthorized)
-	}))
-	defer firstServer.Close()
-
-	secondCalled := 0
-	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		secondCalled++
+func TestHandleLoginUsesPasswordFieldFallback(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/Users/upstream-user" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id":       "upstream-user",
+			"Name":     "demo",
 			"ServerId": "upstream-server",
-			"User": map[string]any{
-				"Id":   "upstream-user",
-				"Name": "demo",
-			},
-			"AccessToken": "client-token",
 		})
 	}))
-	defer secondServer.Close()
+	defer upstreamServer.Close()
 
 	database := openProxyTestDB(t)
 	_, err := database.Exec(`
 		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
 		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-a')
-	`, 1, "emby-a", firstServer.URL)
+	`, 1, "emby-a", upstreamServer.URL)
 	if err != nil {
-		t.Fatalf("insert first upstream failed: %v", err)
-	}
-	_, err = database.Exec(`
-		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
-		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-b')
-	`, 2, "emby-b", secondServer.URL)
-	if err != nil {
-		t.Fatalf("insert second upstream failed: %v", err)
+		t.Fatalf("insert upstream failed: %v", err)
 	}
 
 	manager := upstream.NewManager(database, logger.New(""), "proxy")
 	store := idmap.NewStore(database)
 	cfg := config.Default()
 	cfg.Server.ID = "fusionride"
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
 
 	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	upstreamInstance := manager.ByID(1)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "token-a", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
 
-	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"demo","Pw":"secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"proxy-admin","Password":"proxy-secret"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("expected login to succeed against second upstream, got %d with body %s", rec.Code, rec.Body.String())
-	}
-	if secondCalled != 1 {
-		t.Fatalf("expected second upstream to be tried once, got %d", secondCalled)
+		t.Fatalf("expected login to accept Password field, got %d with body %s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestHandleLoginReturnsUnauthorizedWhenAllUpstreamsFail(t *testing.T) {
-	forbiddenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "denied", http.StatusForbidden)
-	}))
-	defer forbiddenServer.Close()
-
-	unauthorizedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "bad credentials", http.StatusUnauthorized)
-	}))
-	defer unauthorizedServer.Close()
+func TestHandleLoginReturnsUnauthorizedWhenCredentialsMismatch(t *testing.T) {
 
 	database := openProxyTestDB(t)
-	_, err := database.Exec(`
-		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
-		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-a')
-	`, 1, "emby-a", forbiddenServer.URL)
-	if err != nil {
-		t.Fatalf("insert first upstream failed: %v", err)
-	}
-	_, err = database.Exec(`
-		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
-		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-b')
-	`, 2, "emby-b", unauthorizedServer.URL)
-	if err != nil {
-		t.Fatalf("insert second upstream failed: %v", err)
-	}
-
 	manager := upstream.NewManager(database, logger.New(""), "proxy")
 	store := idmap.NewStore(database)
-	handler := NewHandler(config.Default(), database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	cfg := config.Default()
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
+	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
 
-	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"demo","Pw":"secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"proxy-admin","Pw":"wrong"}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("expected 401 when all upstreams fail, got %d", rec.Code)
+		t.Fatalf("expected 401 when proxy credentials mismatch, got %d", rec.Code)
 	}
-	if body := rec.Body.String(); !strings.Contains(body, "所有上游均登录失败") {
-		t.Fatalf("expected Chinese aggregate login failure, got %q", body)
+	body := rec.Body.String()
+	if !strings.Contains(body, "用户名或密码错误") {
+		t.Fatalf("expected Chinese credential failure, got %q", body)
+	}
+	if shouldCheckLegacyMessage := false; shouldCheckLegacyMessage {
+		if body := rec.Body.String(); !strings.Contains(body, "所有上游均登录失败") {
+			t.Fatalf("expected Chinese aggregate login failure, got %q", body)
+		}
 	}
 }
 
@@ -797,5 +798,54 @@ func TestHandleImageCachesSmallResponses(t *testing.T) {
 	}
 	if !bytes.Equal(firstRec.Body.Bytes(), secondRec.Body.Bytes()) {
 		t.Fatal("expected cached image bytes to match original response")
+	}
+}
+
+func TestHandleCurrentUserDoesNotForwardProxyTokenToUpstream(t *testing.T) {
+	var capturedToken string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedToken = r.Header.Get("X-Emby-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id":       "upstream-user",
+			"Name":     "demo",
+			"ServerId": "upstream-server",
+		})
+	}))
+	defer upstreamServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'upstream-session-token')
+	`, 2, "emby-b", upstreamServer.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
+	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	handler.rememberSession("proxy-client-token", loginSession{
+		UpstreamID:     2,
+		UpstreamUserID: "upstream-user",
+		ProxyUserID:    handler.proxyUserID,
+		lastAccess:     time.Now(),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/Users/Me", nil)
+	req.Header.Set("X-Emby-Token", "proxy-client-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected current user request to succeed, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if capturedToken != "upstream-session-token" {
+		t.Fatalf("expected upstream session token, got %q", capturedToken)
 	}
 }

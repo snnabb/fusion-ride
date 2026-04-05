@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/snnabb/fusion-ride/internal/aggregator"
+	"github.com/snnabb/fusion-ride/internal/auth"
 	"github.com/snnabb/fusion-ride/internal/config"
 	"github.com/snnabb/fusion-ride/internal/db"
 	"github.com/snnabb/fusion-ride/internal/idmap"
@@ -23,12 +24,13 @@ import (
 )
 
 type Handler struct {
-	cfg   *config.Config
-	upMgr *upstream.Manager
-	agg   *aggregator.Aggregator
-	ids   *idmap.Store
-	log   *logger.Logger
-	meter *traffic.Meter
+	cfg       *config.Config
+	upMgr     *upstream.Manager
+	agg       *aggregator.Aggregator
+	ids       *idmap.Store
+	log       *logger.Logger
+	meter     *traffic.Meter
+	adminAuth *auth.AdminAuth
 
 	proxyUserID string
 
@@ -58,7 +60,15 @@ type playbackSession struct {
 	lastAccess     time.Time
 }
 
-func NewHandler(cfg *config.Config, database *db.DB, upMgr *upstream.Manager, agg *aggregator.Aggregator, ids *idmap.Store, log *logger.Logger, meter *traffic.Meter) *Handler {
+func NewHandler(cfg *config.Config, database *db.DB, upMgr *upstream.Manager, agg *aggregator.Aggregator, ids *idmap.Store, log *logger.Logger, meter *traffic.Meter, adminAuth ...*auth.AdminAuth) *Handler {
+	var resolvedAdminAuth *auth.AdminAuth
+	if len(adminAuth) > 0 {
+		resolvedAdminAuth = adminAuth[0]
+	}
+	if resolvedAdminAuth == nil {
+		resolvedAdminAuth = auth.NewAdminAuth(database, "")
+	}
+
 	return &Handler{
 		cfg:                    cfg,
 		upMgr:                  upMgr,
@@ -66,6 +76,7 @@ func NewHandler(cfg *config.Config, database *db.DB, upMgr *upstream.Manager, ag
 		ids:                    ids,
 		log:                    log,
 		meter:                  meter,
+		adminAuth:              resolvedAdminAuth,
 		proxyUserID:            loadOrCreateProxyUserID(database),
 		sessions:               make(map[string]loginSession),
 		sessionMaxAge:          24 * time.Hour,
@@ -195,93 +206,207 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var loginReq struct {
 		Username string `json:"Username"`
 		Pw       string `json:"Pw"`
+		Password string `json:"Password"`
 	}
 	if err := json.Unmarshal(body, &loginReq); err != nil {
 		http.Error(w, "登录请求格式错误", http.StatusBadRequest)
 		return
 	}
 
-	onlineUpstreams := h.upMgr.Online()
-	if len(onlineUpstreams) == 0 {
-		http.Error(w, "当前没有可用上游服务", http.StatusServiceUnavailable)
-		return
+	password := loginReq.Pw
+	if password == "" {
+		password = loginReq.Password
 	}
-
-	ctx, cancel := h.withTimeout(r.Context(), h.cfg.Timeouts.Login)
-	defer cancel()
-
-	var (
-		selected *upstream.Upstream
-		respBody []byte
-		lastErr  error
-	)
-
-	for _, candidate := range onlineUpstreams {
-		resp, err := candidate.DoAPIWithHeaders(ctx, http.MethodPost, "/Users/AuthenticateByName", bytes.NewReader(body), r.Header)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		candidateBody, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			lastErr = fmt.Errorf("读取上游 [%s] 登录响应失败: %w", candidate.Name, readErr)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			selected = candidate
-			respBody = candidateBody
-			break
-		}
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			lastErr = fmt.Errorf("上游 [%s] 用户名或密码错误", candidate.Name)
-			continue
-		}
-
-		lastErr = fmt.Errorf("上游 [%s] 返回 HTTP %d", candidate.Name, resp.StatusCode)
-	}
-
-	if selected == nil {
-		if lastErr != nil {
-			h.log.Warn("用户 [%s] 登录失败: %v", loginReq.Username, lastErr)
-		}
-		http.Error(w, "所有上游均登录失败", http.StatusUnauthorized)
-		return
-	}
-
-	var result map[string]any
-	_ = json.Unmarshal(respBody, &result)
-	var upstreamUserID string
-	if _, ok := result["ServerId"].(string); ok {
-		result["ServerId"] = h.cfg.Server.ID
-	}
-	if user, ok := result["User"].(map[string]any); ok {
-		if userID, ok := user["Id"].(string); ok && userID != "" {
-			upstreamUserID = userID
-		}
-		user["Id"] = h.proxyUserID
-		user["ServerId"] = h.cfg.Server.ID
-	}
-	if accessToken, ok := result["AccessToken"].(string); ok && accessToken != "" && upstreamUserID != "" {
-		h.rememberSession(accessToken, loginSession{
-			UpstreamID:     selected.ID,
-			UpstreamUserID: upstreamUserID,
-			ProxyUserID:    h.proxyUserID,
+	if h.adminAuth == nil || !h.adminAuth.VerifyCredentials(loginReq.Username, password) {
+		h.log.Warn("用户 [%s] 登录失败", loginReq.Username)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"message": "用户名或密码错误",
 		})
-	}
-
-	modified, err := json.Marshal(result)
-	if err != nil {
-		http.Error(w, "重写登录响应失败", http.StatusInternalServerError)
 		return
 	}
+
+	loginCtx, loginCancel := h.withTimeout(r.Context(), h.cfg.Timeouts.Login)
+	defer loginCancel()
+
+	primary := h.selectPrimaryUpstream()
+	session := loginSession{
+		ProxyUserID: h.proxyUserID,
+	}
+	if primary != nil {
+		session.UpstreamID = primary.ID
+		session.UpstreamUserID = h.resolveUpstreamUserID(loginCtx, primary)
+	}
+
+	token := generateSecureToken()
+	h.rememberSession(token, session)
 
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(modified)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"User": map[string]any{
+			"Name":                      loginReq.Username,
+			"ServerId":                  h.cfg.Server.ID,
+			"Id":                        h.proxyUserID,
+			"HasPassword":               true,
+			"HasConfiguredPassword":     true,
+			"HasConfiguredEasyPassword": false,
+			"Configuration": map[string]any{
+				"PlayDefaultAudioTrack":      true,
+				"SubtitleLanguagePreference": "",
+				"DisplayMissingEpisodes":     false,
+				"SubtitleMode":               "Default",
+				"EnableLocalPassword":        false,
+			},
+			"Policy": map[string]any{
+				"IsAdministrator":                true,
+				"IsHidden":                       true,
+				"IsDisabled":                     false,
+				"EnableAllFolders":               true,
+				"EnableContentDeletion":          false,
+				"EnableRemoteAccess":             true,
+				"EnableLiveTvAccess":             true,
+				"EnableLiveTvManagement":         false,
+				"EnableMediaPlayback":            true,
+				"EnableAudioPlaybackTranscoding": true,
+				"EnableVideoPlaybackTranscoding": true,
+				"EnablePlaybackRemuxing":         true,
+				"EnableContentDownloading":       true,
+				"EnableSyncTranscoding":          true,
+				"EnableSubtitleManagement":       false,
+				"InvalidLoginAttemptCount":       0,
+			},
+		},
+		"AccessToken": token,
+		"ServerId":    h.cfg.Server.ID,
+	})
+	h.log.Info("用户 [%s] 登录成功", loginReq.Username)
+	if shouldProxyUpstreamLogin := false; shouldProxyUpstreamLogin {
+		onlineUpstreams := h.upMgr.Online()
+		if len(onlineUpstreams) == 0 {
+			http.Error(w, "当前没有可用上游服务", http.StatusServiceUnavailable)
+			return
+		}
 
-	h.log.Info("用户 [%s] 通过上游 [%s] 登录成功", loginReq.Username, selected.Name)
+		ctx, cancel := h.withTimeout(r.Context(), h.cfg.Timeouts.Login)
+		defer cancel()
+
+		var (
+			selected *upstream.Upstream
+			respBody []byte
+			lastErr  error
+		)
+
+		for _, candidate := range onlineUpstreams {
+			resp, err := candidate.DoAPIWithHeaders(ctx, http.MethodPost, "/Users/AuthenticateByName", bytes.NewReader(body), r.Header)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			candidateBody, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				lastErr = fmt.Errorf("读取上游 [%s] 登录响应失败: %w", candidate.Name, readErr)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusOK {
+				selected = candidate
+				respBody = candidateBody
+				break
+			}
+			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				lastErr = fmt.Errorf("上游 [%s] 用户名或密码错误", candidate.Name)
+				continue
+			}
+
+			lastErr = fmt.Errorf("上游 [%s] 返回 HTTP %d", candidate.Name, resp.StatusCode)
+		}
+
+		if selected == nil {
+			if lastErr != nil {
+				h.log.Warn("用户 [%s] 登录失败: %v", loginReq.Username, lastErr)
+			}
+			http.Error(w, "所有上游均登录失败", http.StatusUnauthorized)
+			return
+		}
+
+		var result map[string]any
+		_ = json.Unmarshal(respBody, &result)
+		var upstreamUserID string
+		if _, ok := result["ServerId"].(string); ok {
+			result["ServerId"] = h.cfg.Server.ID
+		}
+		if user, ok := result["User"].(map[string]any); ok {
+			if userID, ok := user["Id"].(string); ok && userID != "" {
+				upstreamUserID = userID
+			}
+			user["Id"] = h.proxyUserID
+			user["ServerId"] = h.cfg.Server.ID
+		}
+		if accessToken, ok := result["AccessToken"].(string); ok && accessToken != "" && upstreamUserID != "" {
+			h.rememberSession(accessToken, loginSession{
+				UpstreamID:     selected.ID,
+				UpstreamUserID: upstreamUserID,
+				ProxyUserID:    h.proxyUserID,
+			})
+		}
+
+		modified, err := json.Marshal(result)
+		if err != nil {
+			http.Error(w, "重写登录响应失败", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(modified)
+
+		h.log.Info("用户 [%s] 通过上游 [%s] 登录成功", loginReq.Username, selected.Name)
+	}
+}
+
+func (h *Handler) selectPrimaryUpstream() *upstream.Upstream {
+	onlineUpstreams := h.upMgr.Online()
+	if len(onlineUpstreams) == 0 {
+		return nil
+	}
+	return onlineUpstreams[0]
+}
+
+func (h *Handler) resolveUpstreamUserID(ctx context.Context, selected *upstream.Upstream) string {
+	if selected == nil {
+		return ""
+	}
+	if userID := selected.GetUserID(); userID != "" {
+		return userID
+	}
+
+	resp, err := selected.DoAPI(ctx, http.MethodGet, "/Users/Me", nil)
+	if err != nil {
+		h.log.Warn("获取上游 [%s] 用户信息失败: %v", selected.Name, err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn("获取上游 [%s] 用户信息失败: HTTP %d", selected.Name, resp.StatusCode)
+		return ""
+	}
+
+	var payload struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		h.log.Warn("解析上游 [%s] 用户信息失败: %v", selected.Name, err)
+		return ""
+	}
+	if payload.ID == "" {
+		return ""
+	}
+
+	selected.SetUserID(payload.ID)
+	return payload.ID
 }
 
 func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
