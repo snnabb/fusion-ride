@@ -210,6 +210,155 @@ func TestUsersMeUsesLoginSessionWhenUpstreamMeEndpointIsBroken(t *testing.T) {
 	}
 }
 
+func TestHandleSystemInfoPublicProxiesUpstreamAndOverlaysFusionRideIdentity(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/System/Info/Public" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ServerName":             "上游 Emby",
+			"Id":                     "upstream-server",
+			"Version":                "4.9.0.50",
+			"ProductName":            "Emby Server",
+			"StartupWizardCompleted": true,
+			"OperatingSystem":        "Linux",
+			"LocalAddress":           "http://10.0.0.2:8096",
+			"WanAddress":             "http://203.0.113.10:8096",
+			"WebSocketPortNumber":    8096,
+		})
+	}))
+	defer upstreamServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, '', 'web', 1, 'online', 'session-token')
+	`, "emby-a", upstreamServer.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	handler := NewHandler(config.Default(), manager, nil, idmap.NewStore(database), logger.New(""), traffic.NewMeter(database))
+	handler.cfg.Server.Name = "FusionRide"
+	handler.cfg.Server.ID = "fusionride"
+
+	req := httptest.NewRequest(http.MethodGet, "/System/Info/Public", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d with body %s", rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal /System/Info/Public failed: %v", err)
+	}
+	if payload["StartupWizardCompleted"] != true {
+		t.Fatalf("expected StartupWizardCompleted=true, got %#v", payload["StartupWizardCompleted"])
+	}
+	if payload["ServerName"] != "FusionRide" {
+		t.Fatalf("expected FusionRide server name, got %#v", payload["ServerName"])
+	}
+	if payload["Id"] != "fusionride" {
+		t.Fatalf("expected FusionRide id, got %#v", payload["Id"])
+	}
+	if payload["ProductName"] != "Emby Server" {
+		t.Fatalf("expected upstream ProductName to be preserved, got %#v", payload["ProductName"])
+	}
+	if _, ok := payload["LocalAddress"]; ok {
+		t.Fatal("expected LocalAddress to be removed")
+	}
+	if _, ok := payload["WanAddress"]; ok {
+		t.Fatal("expected WanAddress to be removed")
+	}
+	if payload["Version"] != "4.9.0.50" {
+		t.Fatalf("expected upstream version to be preserved, got %#v", payload["Version"])
+	}
+}
+
+func TestHandleSystemInfoAuthUsesClientTokenAndOverlaysIdentity(t *testing.T) {
+	var (
+		capturedPath  string
+		capturedToken string
+	)
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedToken = r.Header.Get("X-Emby-Token")
+		if r.URL.Path != "/System/Info" {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ServerName":             "上游 Emby",
+			"Id":                     "upstream-server",
+			"Version":                "4.8.10.0",
+			"ProductName":            "Emby Server",
+			"StartupWizardCompleted": true,
+			"OperatingSystem":        "Linux",
+		})
+	}))
+	defer upstreamServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'upstream-session-token')
+	`, 2, "emby-a", upstreamServer.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	handler := NewHandler(config.Default(), manager, nil, idmap.NewStore(database), logger.New(""), traffic.NewMeter(database))
+	handler.cfg.Server.Name = "FusionRide"
+	handler.cfg.Server.ID = "fusionride"
+	handler.rememberSession("client-token", loginSession{
+		UpstreamID:     2,
+		UpstreamUserID: "user-2",
+		VirtualUserID:  "virtual-user-2",
+		lastAccess:     time.Now(),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/emby/System/Info", nil)
+	req.Header.Set("X-Emby-Token", "client-token")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if capturedPath != "/System/Info" {
+		t.Fatalf("expected upstream path /System/Info, got %q", capturedPath)
+	}
+	if capturedToken != "client-token" {
+		t.Fatalf("expected client token to be forwarded, got %q", capturedToken)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal /System/Info failed: %v", err)
+	}
+	if payload["StartupWizardCompleted"] != true {
+		t.Fatalf("expected StartupWizardCompleted=true, got %#v", payload["StartupWizardCompleted"])
+	}
+	if payload["ServerName"] != "FusionRide" {
+		t.Fatalf("expected FusionRide server name, got %#v", payload["ServerName"])
+	}
+	if payload["Id"] != "fusionride" {
+		t.Fatalf("expected FusionRide id, got %#v", payload["Id"])
+	}
+	if payload["ProductName"] != "Emby Server" {
+		t.Fatalf("expected ProductName to remain Emby Server, got %#v", payload["ProductName"])
+	}
+}
+
 func TestIsAggregatablePathExcludesUsersMe(t *testing.T) {
 	if isAggregatablePath("/emby/Users/Me") {
 		t.Fatal("expected /emby/Users/Me to bypass aggregation")

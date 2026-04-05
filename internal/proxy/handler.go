@@ -143,6 +143,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleLogin(w, r)
 	case path == "/System/Info/Public" || path == "/emby/System/Info/Public":
 		h.handleSystemInfo(w, r)
+	case path == "/System/Info" || path == "/emby/System/Info":
+		h.handleSystemInfoAuth(w, r)
 	case path == "/Users/Me" || path == "/emby/Users/Me":
 		h.handleCurrentUser(w, r)
 	case isPlaybackInfoPath(path):
@@ -319,17 +321,106 @@ func (h *Handler) handleCurrentUser(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-func (h *Handler) handleSystemInfo(w http.ResponseWriter, _ *http.Request) {
-	info := map[string]any{
-		"ServerName":             h.cfg.Server.Name,
-		"Version":                "4.8.0.0",
-		"Id":                     h.cfg.Server.ID,
-		"LocalAddress":           fmt.Sprintf("http://localhost:%d", h.cfg.Server.Port),
-		"OperatingSystem":        "Linux",
-		"HasUpdateAvailable":     false,
-		"SupportsLibraryMonitor": true,
-		"ProductName":            "FusionRide",
+func (h *Handler) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
+	info, ok := h.fetchSystemInfo(r.Context(), "/System/Info/Public", nil, false)
+	if !ok {
+		info = map[string]any{
+			"StartupWizardCompleted": true,
+			"Version":                "4.8.0.0",
+			"OperatingSystem":        "Linux",
+			"ProductName":            "Emby Server",
+		}
 	}
+
+	h.writeSystemInfo(w, info)
+}
+
+func (h *Handler) handleSystemInfoAuth(w http.ResponseWriter, r *http.Request) {
+	info, ok := h.fetchSystemInfo(r.Context(), "/System/Info", r.Header, true)
+	if !ok {
+		info = map[string]any{
+			"StartupWizardCompleted": true,
+			"Version":                "4.8.0.0",
+			"OperatingSystem":        "Linux",
+			"ProductName":            "Emby Server",
+		}
+	}
+
+	h.writeSystemInfo(w, info)
+}
+
+func (h *Handler) fetchSystemInfo(parent context.Context, path string, incoming http.Header, authenticated bool) (map[string]any, bool) {
+	for _, candidate := range h.systemInfoCandidates(incoming) {
+		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+
+		var (
+			resp *http.Response
+			err  error
+		)
+		if authenticated {
+			resp, err = candidate.DoAPIWithHeaders(ctx, http.MethodGet, path, nil, incoming)
+		} else {
+			resp, err = candidate.DoAPI(ctx, http.MethodGet, path, nil)
+		}
+		cancel()
+		if err != nil {
+			continue
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil || resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		var info map[string]any
+		if json.Unmarshal(body, &info) == nil {
+			return info, true
+		}
+	}
+
+	return nil, false
+}
+
+func (h *Handler) systemInfoCandidates(incoming http.Header) []*upstream.Upstream {
+	onlineUpstreams := h.upMgr.Online()
+	if len(onlineUpstreams) == 0 {
+		return nil
+	}
+
+	var candidates []*upstream.Upstream
+	seen := make(map[int]struct{}, len(onlineUpstreams))
+	if incoming != nil {
+		if token := strings.TrimSpace(incoming.Get("X-Emby-Token")); token != "" {
+			if session, ok := h.lookupSession(token); ok {
+				if preferred := h.upMgr.ByID(session.UpstreamID); preferred != nil {
+					candidates = append(candidates, preferred)
+					seen[preferred.ID] = struct{}{}
+				}
+			}
+		}
+	}
+
+	for _, candidate := range onlineUpstreams {
+		if _, ok := seen[candidate.ID]; ok {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+
+	return candidates
+}
+
+func (h *Handler) writeSystemInfo(w http.ResponseWriter, info map[string]any) {
+	if info == nil {
+		info = make(map[string]any)
+	}
+
+	info["StartupWizardCompleted"] = true
+	info["ServerName"] = h.cfg.Server.Name
+	info["Id"] = h.cfg.Server.ID
+	delete(info, "LocalAddress")
+	delete(info, "WanAddress")
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)
