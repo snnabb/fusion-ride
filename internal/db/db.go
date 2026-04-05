@@ -65,6 +65,7 @@ func (d *DB) migrate() error {
 			api_key          TEXT DEFAULT '',
 			playback_mode    TEXT DEFAULT 'proxy',
 			streaming_url    TEXT DEFAULT '',
+			stream_hosts     TEXT DEFAULT '[]',
 			spoof_mode       TEXT DEFAULT 'infuse',
 			custom_ua        TEXT DEFAULT '',
 			custom_client    TEXT DEFAULT '',
@@ -149,9 +150,55 @@ func (d *DB) migrate() error {
 		}
 	}
 
-	if _, err := tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '1')`); err != nil {
+	if err := ensureColumn(tx, "upstreams", "stream_hosts", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '2')`); err != nil {
 		return err
 	}
 
 	return tx.Commit()
+}
+
+func ensureColumn(tx *sql.Tx, table, column, definition string) error {
+	exists, err := columnExists(tx, table, column)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+
+	if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, definition)); err != nil {
+		return fmt.Errorf("为表 %s 添加列 %s 失败: %w", table, column, err)
+	}
+	return nil
+}
+
+func columnExists(tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			ctype      string
+			notnull    int
+			defaultV   any
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &defaultV, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+
+	return false, rows.Err()
 }

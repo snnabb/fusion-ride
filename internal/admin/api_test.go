@@ -63,7 +63,7 @@ func TestHandleUpstreamByIDAcceptsCamelCaseUpdatePayload(t *testing.T) {
 		"username":"alice",
 		"password":"new-pass",
 		"apiKey":"new-api-key",
-		"playbackMode":"redirect",
+		"playbackMode":"direct",
 		"spoofMode":"client",
 		"enabled":false
 	}`))
@@ -88,8 +88,8 @@ func TestHandleUpstreamByIDAcceptsCamelCaseUpdatePayload(t *testing.T) {
 	if u.Username != "alice" || u.Password != "new-pass" || u.APIKey != "new-api-key" {
 		t.Fatalf("expected credentials to be updated, got username=%q password=%q apiKey=%q", u.Username, u.Password, u.APIKey)
 	}
-	if u.PlaybackMode != "redirect" {
-		t.Fatalf("expected playback mode redirect, got %q", u.PlaybackMode)
+	if u.PlaybackMode != "direct" {
+		t.Fatalf("expected playback mode direct, got %q", u.PlaybackMode)
 	}
 	if u.SpoofMode != "client" {
 		t.Fatalf("expected spoof mode client, got %q", u.SpoofMode)

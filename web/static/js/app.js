@@ -11,7 +11,8 @@ let currentUpstreams = [];
 const PLAYBACK_OPTIONS = [
     { value: 'inherit', label: '继承全局默认' },
     { value: 'proxy', label: '代理中转' },
-    { value: 'redirect', label: '302 直连' },
+    { value: 'direct', label: '302 直连' },
+    { value: 'redirect-follow', label: '重定向跟随' },
 ];
 
 const GLOBAL_PLAYBACK_OPTIONS = PLAYBACK_OPTIONS.filter(option => option.value !== 'inherit');
@@ -30,11 +31,19 @@ function normalizePlaybackChoice(upstream) {
     if (!upstream || upstream.playbackInherited || !upstream.playbackModeRaw) {
         return 'inherit';
     }
-    return upstream.playbackModeRaw;
+    return upstream.playbackModeRaw === 'redirect' ? 'redirect-follow' : upstream.playbackModeRaw;
 }
 
 function playbackText(mode) {
-    return mode === 'redirect' ? '302 直连' : '代理中转';
+    switch (mode) {
+        case 'direct':
+            return '302 直连';
+        case 'redirect':
+        case 'redirect-follow':
+            return '重定向跟随';
+        default:
+            return '代理中转';
+    }
 }
 
 function spoofText(mode) {

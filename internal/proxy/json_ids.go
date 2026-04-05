@@ -13,6 +13,7 @@ var idFieldNames = map[string]struct{}{
 	"AlbumId":               {},
 	"ChannelId":             {},
 	"ItemId":                {},
+	"MediaSourceId":         {},
 	"ProgramId":             {},
 	"RecordingId":           {},
 	"UserId":                {},

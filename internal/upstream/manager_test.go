@@ -108,3 +108,59 @@ func TestDoAPIJSONReturnsChineseHTTPError(t *testing.T) {
 		t.Fatalf("expected Chinese HTTP error, got %q", err.Error())
 	}
 }
+
+func TestNormalizePlaybackModeSupportsDirectAndRedirectFollow(t *testing.T) {
+	cases := map[string]string{
+		"":                "",
+		"inherit":         "",
+		"proxy":           "proxy",
+		"direct":          "direct",
+		"redirect":        "direct",
+		"redirect-follow": "redirect",
+		"REDIRECT":        "direct",
+	}
+
+	for input, want := range cases {
+		if got := normalizePlaybackMode(input); got != want {
+			t.Fatalf("normalizePlaybackMode(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestUpdatePersistsStreamHosts(t *testing.T) {
+	database := openManagerTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'infuse', 1, 'online', 'token')
+	`, 1, "emby-a", "https://example.com")
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := NewManager(database, logger.New(""), "proxy")
+	hosts := []string{"cdn1.example.com", "cdn2.example.com"}
+	if err := manager.Update(1, map[string]any{"stream_hosts": hosts}); err != nil {
+		t.Fatalf("update stream hosts failed: %v", err)
+	}
+
+	upstreamInstance := manager.ByID(1)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream to exist")
+	}
+	if len(upstreamInstance.StreamHosts) != len(hosts) {
+		t.Fatalf("expected %d stream hosts, got %d", len(hosts), len(upstreamInstance.StreamHosts))
+	}
+	for i, host := range hosts {
+		if upstreamInstance.StreamHosts[i] != host {
+			t.Fatalf("expected stream host %q at index %d, got %q", host, i, upstreamInstance.StreamHosts[i])
+		}
+	}
+
+	var raw string
+	if err := database.QueryRow(`SELECT stream_hosts FROM upstreams WHERE id = 1`).Scan(&raw); err != nil {
+		t.Fatalf("query stream_hosts failed: %v", err)
+	}
+	if raw != `["cdn1.example.com","cdn2.example.com"]` {
+		t.Fatalf("expected stream_hosts json to be persisted, got %q", raw)
+	}
+}

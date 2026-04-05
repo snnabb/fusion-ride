@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/scrypt"
@@ -25,14 +26,14 @@ type AdminAuth struct {
 	jwtSecret []byte
 }
 
-// NewAdminAuth 创建认证管理器。jwtSecret 为空则随机生成。
+// NewAdminAuth 创建认证管理器。jwtSecret 为空时随机生成。
 func NewAdminAuth(database *db.DB, secret string) *AdminAuth {
 	var jwtSec []byte
 	if secret != "" {
 		jwtSec = []byte(secret)
 	} else {
 		jwtSec = make([]byte, 32)
-		rand.Read(jwtSec)
+		_, _ = rand.Read(jwtSec)
 	}
 
 	return &AdminAuth{
@@ -66,12 +67,13 @@ func (a *AdminAuth) Setup(username, password string) error {
 	return err
 }
 
+// VerifyCredentials 校验用户名和密码。
 func (a *AdminAuth) VerifyCredentials(username, password string) bool {
 	storedUsername, storedHash, err := a.getCredentials()
 	if err != nil {
 		return false
 	}
-	if username != storedUsername {
+	if !strings.EqualFold(strings.TrimSpace(username), strings.TrimSpace(storedUsername)) {
 		return false
 	}
 	return a.checkPassword(password, storedHash)
@@ -84,15 +86,14 @@ func (a *AdminAuth) Login(username, password string) (string, error) {
 		return "", fmt.Errorf("管理员未配置")
 	}
 
-	if username != storedUsername {
+	if !strings.EqualFold(strings.TrimSpace(username), strings.TrimSpace(storedUsername)) {
 		return "", fmt.Errorf("用户名或密码错误")
 	}
-
 	if !a.checkPassword(password, storedHash) {
 		return "", fmt.Errorf("用户名或密码错误")
 	}
 
-	return a.signJWT(username)
+	return a.signJWT(storedUsername)
 }
 
 // VerifyToken 校验 JWT 有效性。
@@ -109,10 +110,12 @@ func (a *AdminAuth) ChangePassword(oldPwd, newPwd string) error {
 	if !a.checkPassword(oldPwd, storedHash) {
 		return fmt.Errorf("旧密码错误")
 	}
+
 	hash, err := hashPassword(newPwd)
 	if err != nil {
 		return err
 	}
+
 	_, err = a.db.Exec(`UPDATE admin SET password_hash = ? WHERE id = 1`, hash)
 	return err
 }
@@ -130,8 +133,6 @@ func (a *AdminAuth) getCredentials() (string, string, error) {
 func (a *AdminAuth) checkPassword(password, storedHash string) bool {
 	return verifyPassword(password, storedHash)
 }
-
-// ── JWT ──
 
 type jwtPayload struct {
 	Sub string `json:"sub"`
@@ -155,7 +156,7 @@ func (a *AdminAuth) signJWT(username string) (string, error) {
 	sigInput := header + "." + body
 
 	mac := hmac.New(sha256.New, a.jwtSecret)
-	mac.Write([]byte(sigInput))
+	_, _ = mac.Write([]byte(sigInput))
 	sig := base64url(mac.Sum(nil))
 
 	return sigInput + "." + sig, nil
@@ -167,32 +168,28 @@ func (a *AdminAuth) verifyJWT(token string) (string, error) {
 		return "", fmt.Errorf("令牌格式错误")
 	}
 
-	// 验签
 	mac := hmac.New(sha256.New, a.jwtSecret)
-	mac.Write([]byte(parts[0] + "." + parts[1]))
+	_, _ = mac.Write([]byte(parts[0] + "." + parts[1]))
 	expectedSig := base64url(mac.Sum(nil))
 	if !hmac.Equal([]byte(expectedSig), []byte(parts[2])) {
 		return "", fmt.Errorf("令牌签名无效")
 	}
 
-	// 解析 payload
 	payloadJSON, err := base64urlDecode(parts[1])
 	if err != nil {
 		return "", fmt.Errorf("令牌载荷无效")
 	}
+
 	var payload jwtPayload
 	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
 		return "", fmt.Errorf("令牌载荷无效")
 	}
-
 	if time.Now().Unix() > payload.Exp {
 		return "", fmt.Errorf("令牌已过期")
 	}
 
 	return payload.Sub, nil
 }
-
-// ── 密码哈希 (scrypt) ──
 
 func hashPassword(password string) (string, error) {
 	salt := make([]byte, saltLen)
@@ -218,7 +215,6 @@ func verifyPassword(password, hash string) bool {
 	if err != nil {
 		return false
 	}
-
 	expected, err := hex.DecodeString(parts[1])
 	if err != nil {
 		return false
@@ -232,13 +228,9 @@ func verifyPassword(password, hash string) bool {
 	return hmac.Equal(dk, expected)
 }
 
-// ── Base64 URL helpers ──
-
+// 为避免引入额外依赖，这里继续使用 hex 编码。
 func base64url(data []byte) string {
-	s := hex.EncodeToString(data)
-	// 简化：使用 hex 编码避免引入额外依赖
-	// 生产环境应使用 encoding/base64.RawURLEncoding
-	return s
+	return hex.EncodeToString(data)
 }
 
 func base64urlDecode(s string) ([]byte, error) {

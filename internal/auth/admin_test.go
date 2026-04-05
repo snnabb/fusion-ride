@@ -38,3 +38,16 @@ func TestVerifyCredentials(t *testing.T) {
 		t.Fatal("expected wrong password to fail verification")
 	}
 }
+
+func TestVerifyCredentialsIgnoresUsernameCase(t *testing.T) {
+	database := openAdminTestDB(t)
+	adminAuth := NewAdminAuth(database, "")
+
+	if err := adminAuth.Setup("proxy-admin", "proxy-secret"); err != nil {
+		t.Fatalf("setup admin failed: %v", err)
+	}
+
+	if !adminAuth.VerifyCredentials("Proxy-Admin", "proxy-secret") {
+		t.Fatal("expected username comparison to be case-insensitive")
+	}
+}

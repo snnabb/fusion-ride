@@ -215,6 +215,7 @@ func (a *API) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 				"hasPassword":       u.Password != "",
 				"hasAPIKey":         u.APIKey != "",
 				"streamingURL":      u.StreamingURL,
+				"streamHosts":       append([]string(nil), u.StreamHosts...),
 				"enabled":           u.Enabled,
 				"healthStatus":      u.HealthStatus,
 				"playbackMode":      u.EffectivePlaybackMode(a.cfg.Playback.Mode),
@@ -230,13 +231,15 @@ func (a *API) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 
 	case "POST":
 		var req struct {
-			Name         string `json:"name"`
-			URL          string `json:"url"`
-			Username     string `json:"username"`
-			Password     string `json:"password"`
-			APIKey       string `json:"apiKey"`
-			PlaybackMode string `json:"playbackMode"`
-			SpoofMode    string `json:"spoofMode"`
+			Name         string   `json:"name"`
+			URL          string   `json:"url"`
+			Username     string   `json:"username"`
+			Password     string   `json:"password"`
+			APIKey       string   `json:"apiKey"`
+			PlaybackMode string   `json:"playbackMode"`
+			SpoofMode    string   `json:"spoofMode"`
+			StreamingURL string   `json:"streamingURL"`
+			StreamHosts  []string `json:"streamHosts"`
 		}
 		if err := readJSON(r, &req); err != nil {
 			jsonError(w, "请求格式错误", http.StatusBadRequest)
@@ -247,7 +250,7 @@ func (a *API) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		id, err := a.upMgr.Add(req.Name, req.URL, req.Username, req.Password, req.APIKey, req.PlaybackMode, req.SpoofMode)
+		id, err := a.upMgr.Add(req.Name, req.URL, req.Username, req.Password, req.APIKey, req.PlaybackMode, req.SpoofMode, req.StreamingURL, req.StreamHosts)
 		if err != nil {
 			jsonError(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -308,15 +311,16 @@ func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case "PUT":
 			var req struct {
-				Name         *string `json:"name"`
-				URL          *string `json:"url"`
-				Username     *string `json:"username"`
-				Password     *string `json:"password"`
-				APIKey       *string `json:"apiKey"`
-				PlaybackMode *string `json:"playbackMode"`
-				SpoofMode    *string `json:"spoofMode"`
-				Enabled      *bool   `json:"enabled"`
-				StreamingURL *string `json:"streamingURL"`
+				Name         *string  `json:"name"`
+				URL          *string  `json:"url"`
+				Username     *string  `json:"username"`
+				Password     *string  `json:"password"`
+				APIKey       *string  `json:"apiKey"`
+				PlaybackMode *string  `json:"playbackMode"`
+				SpoofMode    *string  `json:"spoofMode"`
+				Enabled      *bool    `json:"enabled"`
+				StreamingURL *string  `json:"streamingURL"`
+				StreamHosts  []string `json:"streamHosts"`
 			}
 			if err := readJSON(r, &req); err != nil {
 				jsonError(w, "请求格式错误", http.StatusBadRequest)
@@ -349,6 +353,9 @@ func (a *API) handleUpstreamByID(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.StreamingURL != nil {
 				fields["streaming_url"] = strings.TrimSpace(*req.StreamingURL)
+			}
+			if req.StreamHosts != nil {
+				fields["stream_hosts"] = req.StreamHosts
 			}
 
 			if err := a.upMgr.Update(id, fields); err != nil {

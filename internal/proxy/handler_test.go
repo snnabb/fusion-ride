@@ -849,3 +849,252 @@ func TestHandleCurrentUserDoesNotForwardProxyTokenToUpstream(t *testing.T) {
 		t.Fatalf("expected upstream session token, got %q", capturedToken)
 	}
 }
+
+func TestHandleLoginAcceptsFormBodyAndReturnsSessionInfo(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/Users/upstream-user" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id":       "upstream-user",
+			"Name":     "demo",
+			"ServerId": "upstream-server",
+		})
+	}))
+	defer upstreamServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-a')
+	`, 1, "emby-a", upstreamServer.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	cfg.Server.ID = "fusionride"
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
+
+	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	upstreamInstance := manager.ByID(1)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "token-a", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader("Username=PROXY-ADMIN&Pw=proxy-secret"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Emby-Client", "Hills")
+	req.Header.Set("X-Emby-Device-Name", "Windows PC")
+	req.Header.Set("X-Emby-Device-Id", "pc-001")
+	req.Header.Set("X-Emby-Client-Version", "4.9.0")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected form login to succeed, got %d with body %s", rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal login response failed: %v", err)
+	}
+	user := payload["User"].(map[string]any)
+	if user["Id"] != handler.proxyUserID {
+		t.Fatalf("expected proxy user id, got %#v", user["Id"])
+	}
+	if user["LastLoginDate"] == "" || user["LastActivityDate"] == "" {
+		t.Fatalf("expected login timestamps in user payload, got %#v", user)
+	}
+	sessionInfo, ok := payload["SessionInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected SessionInfo in login response, got %#v", payload["SessionInfo"])
+	}
+	if sessionInfo["UserId"] != handler.proxyUserID {
+		t.Fatalf("expected SessionInfo user id %q, got %#v", handler.proxyUserID, sessionInfo["UserId"])
+	}
+	if sessionInfo["Client"] != "Hills" || sessionInfo["DeviceName"] != "Windows PC" {
+		t.Fatalf("expected device metadata in SessionInfo, got %#v", sessionInfo)
+	}
+}
+
+func TestHandleLoginExtractsCredentialsFromAuthorizationHeader(t *testing.T) {
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/Users/upstream-user" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id":       "upstream-user",
+			"Name":     "demo",
+			"ServerId": "upstream-server",
+		})
+	}))
+	defer upstreamServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-a')
+	`, 1, "emby-a", upstreamServer.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	cfg.Admin.Username = "proxy-admin"
+	cfg.Admin.Password = "proxy-secret"
+	setupProxyAdmin(t, database, cfg.Admin.Username, cfg.Admin.Password)
+
+	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	upstreamInstance := manager.ByID(1)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "token-a", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/Users/AuthenticateByName", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Emby-Authorization", `MediaBrowser Username="proxy-admin", Password="proxy-secret", Client="Legacy", Device="Old TV", DeviceId="old-device", Version="1.0.0"`)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected header-based login to succeed, got %d with body %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandlePlaybackInfoRewritesMediaSourceURLsToProxy(t *testing.T) {
+	upstreamBase := "https://upstream.example"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"MediaSources": []map[string]any{{
+				"Id":                   "media-1",
+				"ItemId":               "item-original",
+				"DirectStreamUrl":      upstreamBase + "/Videos/item-original/stream?Static=true",
+				"TranscodingUrl":       upstreamBase + "/Videos/item-original/master.m3u8?MediaSourceId=media-1",
+				"Path":                 "/srv/media/item-original.mkv",
+				"SupportsDirectPlay":   true,
+				"SupportsDirectStream": true,
+				"SupportsTranscoding":  true,
+			}},
+			"PlaySessionId": "play-1",
+		})
+	}))
+	defer server.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'web', 1, 'online', 'token')
+	`, 2, "emby-b", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	handler := NewHandler(cfg, database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+	upstreamInstance := manager.ByID(2)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "token", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
+
+	virtualID := store.GetOrCreate("item-original", 2, "Movie")
+	req := httptest.NewRequest(http.MethodPost, "/emby/Items/"+virtualID+"/PlaybackInfo?UserId="+handler.proxyUserID, strings.NewReader(`{"ItemId":"`+virtualID+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected playback info 200, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), upstreamBase) {
+		t.Fatalf("expected playback info response not to leak upstream URL, got %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "/srv/media/") {
+		t.Fatalf("expected playback info response not to leak upstream path, got %s", rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal playback info failed: %v", err)
+	}
+	mediaSources := payload["MediaSources"].([]any)
+	mediaSource := mediaSources[0].(map[string]any)
+	if mediaSource["SupportsDirectPlay"] != false {
+		t.Fatalf("expected SupportsDirectPlay=false, got %#v", mediaSource["SupportsDirectPlay"])
+	}
+	if _, exists := mediaSource["DirectStreamUrl"]; exists {
+		t.Fatalf("expected DirectStreamUrl to be removed, got %#v", mediaSource["DirectStreamUrl"])
+	}
+	transcodingURL, _ := mediaSource["TranscodingUrl"].(string)
+	if !strings.HasPrefix(transcodingURL, "/") {
+		t.Fatalf("expected relative transcoding url, got %q", transcodingURL)
+	}
+	if mediaSource["ItemId"] != virtualID {
+		t.Fatalf("expected item id to remain virtualized, got %#v", mediaSource["ItemId"])
+	}
+}
+
+func TestHandleStreamDirectModeRedirectsToStreamingURL(t *testing.T) {
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, streaming_url, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'direct', ?, 'web', 1, 'online', 'token')
+	`, 2, "emby-b", "https://api.example.com", "https://stream.example.com")
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	handler := NewHandler(config.Default(), database, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	upstreamInstance := manager.ByID(2)
+	if upstreamInstance == nil {
+		t.Fatal("expected upstream instance")
+	}
+	upstreamInstance.Mu.Lock()
+	upstreamInstance.HealthStatus = "online"
+	upstreamInstance.Session = &auth.UpstreamSession{Token: "token", UserID: "upstream-user"}
+	upstreamInstance.Mu.Unlock()
+
+	virtualID := store.GetOrCreate("item-original", 2, "Movie")
+	req := httptest.NewRequest(http.MethodGet, "/emby/Videos/"+virtualID+"/stream?Static=true", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("expected direct playback mode to redirect, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	location := rec.Header().Get("Location")
+	if !strings.HasPrefix(location, "https://stream.example.com/Videos/item-original/stream?Static=true") {
+		t.Fatalf("expected redirect to streaming_url, got %q", location)
+	}
+	if !strings.Contains(location, "api_key=token") {
+		t.Fatalf("expected redirect url to include upstream session token, got %q", location)
+	}
+}

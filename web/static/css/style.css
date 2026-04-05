@@ -492,6 +492,7 @@ input::placeholder { color: var(--text-muted); }
 }
 
 .badge-proxy { background: rgba(96, 165, 250, 0.15); color: var(--blue); }
+.badge-direct { background: var(--yellow-dim); color: var(--yellow); }
 .badge-redirect { background: var(--yellow-dim); color: var(--yellow); }
 .badge-inherit { background: rgba(255, 255, 255, 0.08); color: var(--text-primary); }
 .badge-infuse { background: rgba(124, 92, 252, 0.15); color: var(--accent-light); }

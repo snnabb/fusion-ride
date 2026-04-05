@@ -150,34 +150,35 @@ func (h *Handler) cleanupExpiredPlaybackSessions(now time.Time) int {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
+	routePath := normalizeRoutePath(path)
 
 	switch {
 	case isWebSocket(r):
 		h.handleWebSocket(w, r)
-	case strings.HasSuffix(path, "/AuthenticateByName"):
-		h.handleLogin(w, r)
-	case path == "/Users/Public" || path == "/emby/Users/Public":
+	case strings.HasSuffix(routePath, "/AuthenticateByName"):
+		h.handleLoginCompat(w, r)
+	case routePath == "/Users/Public":
 		h.handleUsersPublic(w, r)
-	case path == "/System/Info/Public" || path == "/emby/System/Info/Public":
+	case routePath == "/System/Info/Public":
 		h.handleSystemInfo(w, r)
-	case path == "/System/Info" || path == "/emby/System/Info":
+	case routePath == "/System/Info":
 		h.handleSystemInfoAuth(w, r)
-	case path == "/Users/Me" || path == "/emby/Users/Me":
+	case routePath == "/Users/Me":
 		h.handleCurrentUser(w, r)
-	case h.isProxyUserPath(path):
+	case h.isProxyUserPath(routePath):
 		h.handleProxyUserRequest(w, r)
-	case isPlaybackInfoPath(path):
-		h.handlePlaybackInfo(w, r)
-	case isPlaybackReportPath(path):
+	case isPlaybackInfoPath(routePath):
+		h.handlePlaybackInfoCompat(w, r)
+	case isPlaybackReportPath(routePath):
 		h.handlePlaybackReport(w, r)
-	case isStreamPath(path):
-		h.handleStream(w, r)
-	case isImagePath(path):
+	case isStreamPath(routePath):
+		h.handleStreamCompat(w, r)
+	case isImagePath(routePath):
 		h.handleImage(w, r)
-	case isAggregatablePath(path):
+	case isAggregatablePath(routePath):
 		h.handleAggregate(w, r)
-	case extractVirtualID(path) != "":
-		h.handleSingleItem(w, r, extractVirtualID(path))
+	case extractVirtualID(routePath) != "":
+		h.handleSingleItem(w, r, extractVirtualID(routePath))
 	default:
 		h.handleFallback(w, r)
 	}

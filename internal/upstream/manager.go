@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -23,8 +24,9 @@ type Upstream struct {
 	ID           int
 	Name         string
 	URL          string
-	PlaybackMode string // "proxy" | "redirect"
+	PlaybackMode string // "proxy" | "direct" | "redirect"
 	StreamingURL string
+	StreamHosts  []string
 	SpoofMode    string
 	Enabled      bool
 	Priority     int
@@ -64,7 +66,7 @@ func NewManager(database *db.DB, log *logger.Logger, globalPlaybackMode string) 
 		db:        database,
 		log:       log,
 		stopCh:    make(chan struct{}),
-		globalPBM: globalPlaybackMode,
+		globalPBM: normalizePlaybackMode(globalPlaybackMode),
 	}
 	m.loadFromDB()
 	return m
@@ -73,6 +75,7 @@ func NewManager(database *db.DB, log *logger.Logger, globalPlaybackMode string) 
 func (m *Manager) All() []*Upstream {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
 	out := make([]*Upstream, len(m.upstreams))
 	copy(out, m.upstreams)
 	return out
@@ -105,15 +108,22 @@ func (m *Manager) ByID(id int) *Upstream {
 	return nil
 }
 
-func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoofMode string) (int, error) {
-	url = strings.TrimRight(url, "/")
+func (m *Manager) Add(name, urlValue, username, password, apiKey, playbackMode, spoofMode, streamingURL string, streamHosts []string) (int, error) {
+	urlValue = strings.TrimRight(urlValue, "/")
+	streamingURL = strings.TrimRight(streamingURL, "/")
 	playbackMode = normalizePlaybackMode(playbackMode)
 	spoofMode = identity.NormalizeMode(spoofMode)
+	streamHosts = normalizeStreamHosts(streamHosts)
+
+	streamHostsJSON, err := marshalStreamHosts(streamHosts)
+	if err != nil {
+		return 0, fmt.Errorf("序列化流媒体主机列表失败: %w", err)
+	}
 
 	result, err := m.db.Exec(
-		`INSERT INTO upstreams(name, url, username, password, api_key, playback_mode, spoof_mode)
-		 VALUES(?, ?, ?, ?, ?, ?, ?)`,
-		name, url, username, password, apiKey, playbackMode, spoofMode,
+		`INSERT INTO upstreams(name, url, username, password, api_key, playback_mode, streaming_url, stream_hosts, spoof_mode)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		name, urlValue, username, password, apiKey, playbackMode, streamingURL, streamHostsJSON, spoofMode,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("保存上游失败: %w", err)
@@ -123,11 +133,13 @@ func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoof
 	u := &Upstream{
 		ID:           int(id),
 		Name:         name,
-		URL:          url,
+		URL:          urlValue,
 		Username:     username,
 		Password:     password,
 		APIKey:       apiKey,
 		PlaybackMode: playbackMode,
+		StreamingURL: streamingURL,
+		StreamHosts:  append([]string(nil), streamHosts...),
 		SpoofMode:    spoofMode,
 		Enabled:      true,
 		HealthStatus: "unknown",
@@ -139,8 +151,7 @@ func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoof
 	m.upstreams = append(m.upstreams, u)
 	m.mu.Unlock()
 
-	m.log.Info("已添加上游 [%s] %s", name, url)
-
+	m.log.Info("已添加上游 [%s] %s", name, urlValue)
 	go m.authenticate(u)
 
 	return int(id), nil
@@ -162,7 +173,6 @@ func (m *Manager) Remove(id int) error {
 	}
 
 	name := m.upstreams[idx].Name
-
 	if _, err := m.db.Exec(`DELETE FROM upstreams WHERE id = ?`, id); err != nil {
 		return err
 	}
@@ -181,104 +191,125 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 	setClauses := make([]string, 0, len(fields))
 	values := make([]any, 0, len(fields))
 	normalized := make(map[string]any, len(fields))
-	for k, v := range fields {
-		switch k {
+
+	for key, value := range fields {
+		switch key {
 		case "name", "username", "password", "api_key", "streaming_url":
-			value, ok := v.(string)
+			text, ok := value.(string)
 			if !ok {
-				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, k)
+				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, key)
 			}
-			normalized[k] = value
+			if key == "streaming_url" {
+				text = strings.TrimRight(text, "/")
+			}
+			normalized[key] = text
 		case "url":
-			value, ok := v.(string)
+			text, ok := value.(string)
 			if !ok {
 				return fmt.Errorf("上游 %d 的 URL 类型错误", id)
 			}
-			normalized[k] = strings.TrimRight(value, "/")
+			normalized[key] = strings.TrimRight(text, "/")
 		case "playback_mode":
-			value, ok := v.(string)
+			text, ok := value.(string)
 			if !ok {
 				return fmt.Errorf("上游 %d 的播放模式类型错误", id)
 			}
-			normalized[k] = normalizePlaybackMode(value)
+			normalized[key] = normalizePlaybackMode(text)
 		case "spoof_mode":
-			value, ok := v.(string)
+			text, ok := value.(string)
 			if !ok {
 				return fmt.Errorf("上游 %d 的 UA 伪装模式类型错误", id)
 			}
-			normalized[k] = identity.NormalizeMode(value)
+			normalized[key] = identity.NormalizeMode(text)
 		case "enabled", "priority_meta", "follow_redirects":
-			value, ok := v.(bool)
+			flag, ok := value.(bool)
 			if !ok {
-				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, k)
+				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, key)
 			}
-			normalized[k] = value
+			normalized[key] = flag
 		case "priority":
-			value, ok := v.(int)
+			number, ok := value.(int)
 			if !ok {
 				return fmt.Errorf("上游 %d 的优先级类型错误", id)
 			}
-			normalized[k] = value
+			normalized[key] = number
+		case "stream_hosts":
+			hosts, err := normalizeStreamHostsValue(value)
+			if err != nil {
+				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, key)
+			}
+			streamHostsJSON, err := marshalStreamHosts(hosts)
+			if err != nil {
+				return fmt.Errorf("序列化上游 %d 的流媒体主机列表失败: %w", id, err)
+			}
+			normalized[key] = streamHostsJSON
+			normalized["stream_hosts_runtime"] = hosts
 		default:
-			return fmt.Errorf("不支持的字段 %s", k)
+			return fmt.Errorf("不支持的字段 %s", key)
 		}
 	}
-	for k, v := range normalized {
-		setClauses = append(setClauses, k+" = ?")
-		values = append(values, v)
+
+	for key, value := range normalized {
+		if key == "stream_hosts_runtime" {
+			continue
+		}
+		setClauses = append(setClauses, key+" = ?")
+		values = append(values, value)
 	}
+
 	if len(setClauses) == 0 {
 		return nil
 	}
+
 	values = append(values, id)
-
-	query := fmt.Sprintf("UPDATE upstreams SET %s, updated_at = unixepoch() WHERE id = ?",
-		strings.Join(setClauses, ", "))
-
+	query := fmt.Sprintf("UPDATE upstreams SET %s, updated_at = unixepoch() WHERE id = ?", strings.Join(setClauses, ", "))
 	if _, err := m.db.Exec(query, values...); err != nil {
 		return err
 	}
 
 	u.Mu.Lock()
 	shouldReconnect := false
-	if v, ok := normalized["name"]; ok {
-		u.Name = v.(string)
+	if value, ok := normalized["name"]; ok {
+		u.Name = value.(string)
 	}
-	if v, ok := normalized["url"]; ok {
-		u.URL = strings.TrimRight(v.(string), "/")
+	if value, ok := normalized["url"]; ok {
+		u.URL = value.(string)
 		shouldReconnect = true
 	}
-	if v, ok := normalized["playback_mode"]; ok {
-		u.PlaybackMode = v.(string)
+	if value, ok := normalized["playback_mode"]; ok {
+		u.PlaybackMode = value.(string)
 	}
-	if v, ok := normalized["username"]; ok {
-		u.Username = v.(string)
+	if value, ok := normalized["username"]; ok {
+		u.Username = value.(string)
 		shouldReconnect = true
 	}
-	if v, ok := normalized["password"]; ok {
-		u.Password = v.(string)
+	if value, ok := normalized["password"]; ok {
+		u.Password = value.(string)
 		shouldReconnect = true
 	}
-	if v, ok := normalized["api_key"]; ok {
-		u.APIKey = v.(string)
+	if value, ok := normalized["api_key"]; ok {
+		u.APIKey = value.(string)
 		shouldReconnect = true
 	}
-	if v, ok := normalized["spoof_mode"]; ok {
-		u.SpoofMode = v.(string)
+	if value, ok := normalized["spoof_mode"]; ok {
+		u.SpoofMode = value.(string)
 		u.Spoofer = identity.NewSpoofer(u.SpoofMode, "", "", "", "", "")
 		shouldReconnect = true
 	}
-	if v, ok := normalized["streaming_url"]; ok {
-		u.StreamingURL = strings.TrimRight(v.(string), "/")
+	if value, ok := normalized["streaming_url"]; ok {
+		u.StreamingURL = value.(string)
 	}
-	if v, ok := normalized["priority"]; ok {
-		u.Priority = v.(int)
+	if value, ok := normalized["stream_hosts_runtime"]; ok {
+		u.StreamHosts = append([]string(nil), value.([]string)...)
 	}
-	if v, ok := normalized["priority_meta"]; ok {
-		u.PriorityMeta = v.(bool)
+	if value, ok := normalized["priority"]; ok {
+		u.Priority = value.(int)
 	}
-	if v, ok := normalized["enabled"]; ok {
-		u.Enabled = v.(bool)
+	if value, ok := normalized["priority_meta"]; ok {
+		u.PriorityMeta = value.(bool)
+	}
+	if value, ok := normalized["enabled"]; ok {
+		u.Enabled = value.(bool)
 		if u.Enabled {
 			shouldReconnect = true
 		}
@@ -322,7 +353,6 @@ func (m *Manager) Reorder(ids []int) error {
 			return err
 		}
 	}
-
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -371,10 +401,11 @@ func (m *Manager) Stop() {
 func (m *Manager) loadFromDB() {
 	rows, err := m.db.Query(
 		`SELECT id, name, url, username, password, api_key, playback_mode, streaming_url,
-		        spoof_mode, custom_ua, custom_client, custom_version, custom_device,
+		        stream_hosts, spoof_mode, custom_ua, custom_client, custom_version, custom_device,
 		        custom_device_id, proxy_id, priority, priority_meta, follow_redirects,
 		        enabled, health_status, session_token
-		 FROM upstreams ORDER BY priority ASC`)
+		 FROM upstreams ORDER BY priority ASC`,
+	)
 	if err != nil {
 		m.log.Error("加载上游列表失败: %v", err)
 		return
@@ -383,13 +414,17 @@ func (m *Manager) loadFromDB() {
 
 	for rows.Next() {
 		var u Upstream
-		var customUA, customClient, customVer, customDev, customDevID, proxyID, sessionToken string
-		var followRedirects bool
+		var (
+			streamHostsJSON                                     string
+			customUA, customClient, customVersion, customDevice string
+			customDeviceID, proxyID, sessionToken               string
+			followRedirects                                     bool
+		)
 
 		err := rows.Scan(
 			&u.ID, &u.Name, &u.URL, &u.Username, &u.Password, &u.APIKey,
-			&u.PlaybackMode, &u.StreamingURL, &u.SpoofMode,
-			&customUA, &customClient, &customVer, &customDev, &customDevID,
+			&u.PlaybackMode, &u.StreamingURL, &streamHostsJSON, &u.SpoofMode,
+			&customUA, &customClient, &customVersion, &customDevice, &customDeviceID,
 			&proxyID, &u.Priority, &u.PriorityMeta, &followRedirects,
 			&u.Enabled, &u.HealthStatus, &sessionToken,
 		)
@@ -399,9 +434,11 @@ func (m *Manager) loadFromDB() {
 		}
 
 		u.URL = strings.TrimRight(u.URL, "/")
+		u.StreamingURL = strings.TrimRight(u.StreamingURL, "/")
 		u.PlaybackMode = normalizePlaybackMode(u.PlaybackMode)
+		u.StreamHosts = unmarshalStreamHosts(streamHostsJSON)
 		u.SpoofMode = identity.NormalizeMode(u.SpoofMode)
-		u.Spoofer = identity.NewSpoofer(u.SpoofMode, customUA, customClient, customVer, customDev, customDevID)
+		u.Spoofer = identity.NewSpoofer(u.SpoofMode, customUA, customClient, customVersion, customDevice, customDeviceID)
 		u.Client = &http.Client{Timeout: 30 * time.Second}
 
 		if sessionToken != "" {
@@ -425,16 +462,14 @@ func (m *Manager) authenticate(u *Upstream) {
 	password := u.Password
 	apiKey := u.APIKey
 	headers := u.Spoofer.Headers()
+	name := u.Name
 	u.Mu.Unlock()
 
-	m.log.Info("正在认证上游 [%s]", u.Name)
+	m.log.Info("正在认证上游 [%s]", name)
 
-	session, err := auth.AuthenticateUpstream(
-		baseURL, username, password, apiKey, headers,
-		10*time.Second,
-	)
+	session, err := auth.AuthenticateUpstream(baseURL, username, password, apiKey, headers, 10*time.Second)
 	if err != nil {
-		m.log.Error("上游 [%s] 认证失败: %v", u.Name, err)
+		m.log.Error("上游 [%s] 认证失败: %v", name, err)
 		u.Mu.Lock()
 		u.HealthStatus = "offline"
 		u.HealthMessage = err.Error()
@@ -449,10 +484,8 @@ func (m *Manager) authenticate(u *Upstream) {
 	u.HealthMessage = "认证成功"
 	u.Mu.Unlock()
 
-	m.db.Exec(`UPDATE upstreams SET session_token = ?, health_status = 'online' WHERE id = ?`,
-		session.Token, u.ID)
-
-	m.log.Info("上游 [%s] 认证成功", u.Name)
+	_, _ = m.db.Exec(`UPDATE upstreams SET session_token = ?, health_status = 'online' WHERE id = ?`, session.Token, u.ID)
+	m.log.Info("上游 [%s] 认证成功", name)
 }
 
 func (m *Manager) checkAllHealth(timeout time.Duration) {
@@ -498,8 +531,7 @@ func (m *Manager) checkAllHealth(timeout time.Duration) {
 				}
 			}
 
-			m.db.Exec(`UPDATE upstreams SET health_status = ?, last_check = ? WHERE id = ?`,
-				newStatus, u.LastCheck.Unix(), u.ID)
+			_, _ = m.db.Exec(`UPDATE upstreams SET health_status = ?, last_check = ? WHERE id = ?`, newStatus, u.LastCheck.Unix(), u.ID)
 		}(u)
 	}
 
@@ -509,53 +541,48 @@ func (m *Manager) checkAllHealth(timeout time.Duration) {
 func (u *Upstream) DoAPI(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	u.Mu.RLock()
 	baseURL := u.URL
-	session := u.Session
-	headers := u.Spoofer.Headers()
 	u.Mu.RUnlock()
 
-	if session == nil {
-		return nil, fmt.Errorf("上游 [%s] 尚未认证", u.Name)
-	}
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	url := baseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("X-Emby-Token", session.Token)
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-
-	return u.Client.Do(req)
+	return u.doWithHeaders(ctx, baseURL, method, path, body, nil, nil)
 }
 
 func (u *Upstream) DoAPIWithHeaders(ctx context.Context, method, path string, body io.Reader, incoming http.Header) (*http.Response, error) {
 	u.Mu.RLock()
 	baseURL := u.URL
+	u.Mu.RUnlock()
+
+	return u.doWithHeaders(ctx, baseURL, method, path, body, incoming, nil)
+}
+
+func (u *Upstream) DoPlaybackWithHeaders(ctx context.Context, method, path string, body io.Reader, incoming http.Header, clientOverride *http.Client) (*http.Response, error) {
+	return u.doWithHeaders(ctx, u.PlaybackBaseURL(), method, path, body, incoming, clientOverride)
+}
+
+func (u *Upstream) doWithHeaders(ctx context.Context, baseURL, method, path string, body io.Reader, incoming http.Header, clientOverride *http.Client) (*http.Response, error) {
+	u.Mu.RLock()
+	name := u.Name
 	session := u.Session
 	spoofer := u.Spoofer
 	client := u.Client
 	u.Mu.RUnlock()
 
 	if session == nil {
-		return nil, fmt.Errorf("上游 [%s] 尚未认证", u.Name)
+		return nil, fmt.Errorf("上游 [%s] 尚未认证", name)
 	}
 	if spoofer == nil {
 		spoofer = identity.NewSpoofer("infuse", "", "", "", "", "")
 	}
-
+	if clientOverride != nil {
+		client = clientOverride
+	}
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	url := baseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(baseURL, "/")+path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -563,11 +590,11 @@ func (u *Upstream) DoAPIWithHeaders(ctx context.Context, method, path string, bo
 	copyForwardHeaders(req.Header, incoming)
 	req.Header.Set("X-Emby-Token", session.Token)
 	if incoming != nil {
-		if auth := incoming.Get("Authorization"); auth != "" {
-			req.Header.Set("Authorization", auth)
+		if authHeader := incoming.Get("Authorization"); authHeader != "" {
+			req.Header.Set("Authorization", authHeader)
 		}
-		if auth := incoming.Get("X-Emby-Authorization"); auth != "" {
-			req.Header.Set("X-Emby-Authorization", auth)
+		if embyAuth := incoming.Get("X-Emby-Authorization"); embyAuth != "" {
+			req.Header.Set("X-Emby-Authorization", embyAuth)
 		}
 	}
 	spoofer.ApplyToHeader(req.Header)
@@ -582,9 +609,9 @@ func (u *Upstream) DoAPIJSON(ctx context.Context, method, path string, body io.R
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, string(b))
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, string(payload))
 	}
 
 	return json.NewDecoder(resp.Body).Decode(result)
@@ -594,7 +621,11 @@ func normalizePlaybackMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "", "inherit":
 		return ""
-	case "redirect":
+	case "proxy":
+		return "proxy"
+	case "direct", "redirect":
+		return "direct"
+	case "redirect-follow":
 		return "redirect"
 	default:
 		return "proxy"
@@ -641,9 +672,9 @@ func (u *Upstream) EffectivePlaybackMode(globalMode string) string {
 	u.Mu.RLock()
 	defer u.Mu.RUnlock()
 	if u.PlaybackMode != "" {
-		return u.PlaybackMode
+		return normalizePlaybackMode(u.PlaybackMode)
 	}
-	return globalMode
+	return normalizePlaybackMode(globalMode)
 }
 
 func (u *Upstream) GetUserID() string {
@@ -664,23 +695,147 @@ func (u *Upstream) SetUserID(userID string) {
 	u.Session.UserID = strings.TrimSpace(userID)
 }
 
+func (u *Upstream) PlaybackBaseURL() string {
+	u.Mu.RLock()
+	defer u.Mu.RUnlock()
+	return u.playbackBaseURLLocked()
+}
+
+func (u *Upstream) playbackBaseURLLocked() string {
+	base := strings.TrimRight(u.URL, "/")
+	if u.StreamingURL != "" {
+		base = strings.TrimRight(u.StreamingURL, "/")
+	}
+	return base
+}
+
 func (u *Upstream) BuildStreamURL(originalID string, query string) string {
 	u.Mu.RLock()
 	defer u.Mu.RUnlock()
 
-	base := u.URL
-	if u.StreamingURL != "" {
-		base = strings.TrimRight(u.StreamingURL, "/")
+	streamURL := fmt.Sprintf("%s/Videos/%s/stream", u.playbackBaseURLLocked(), originalID)
+	if query != "" {
+		streamURL += "?" + query
 	}
-
-	streamURL := fmt.Sprintf("%s/Videos/%s/stream?%s", base, originalID, query)
-
 	if u.Session != nil {
 		if query != "" {
 			streamURL += "&"
+		} else {
+			streamURL += "?"
 		}
 		streamURL += "api_key=" + u.Session.Token
 	}
-
 	return streamURL
+}
+
+func (u *Upstream) AllowedStreamHosts() map[string]bool {
+	u.Mu.RLock()
+	defer u.Mu.RUnlock()
+
+	allowed := make(map[string]bool)
+	addAllowedHost(allowed, u.URL)
+	addAllowedHost(allowed, u.StreamingURL)
+	for _, host := range u.StreamHosts {
+		addAllowedHost(allowed, host)
+	}
+	return allowed
+}
+
+func normalizeStreamHostsValue(value any) ([]string, error) {
+	switch typed := value.(type) {
+	case []string:
+		return normalizeStreamHosts(typed), nil
+	case []any:
+		hosts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			text, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("stream_hosts contains non-string value")
+			}
+			hosts = append(hosts, text)
+		}
+		return normalizeStreamHosts(hosts), nil
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil, nil
+		}
+		return normalizeStreamHosts([]string{typed}), nil
+	default:
+		return nil, fmt.Errorf("unsupported stream_hosts type %T", value)
+	}
+}
+
+func normalizeStreamHosts(hosts []string) []string {
+	if len(hosts) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(hosts))
+	out := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		host = strings.ToLower(strings.TrimSpace(host))
+		host = strings.TrimPrefix(host, "http://")
+		host = strings.TrimPrefix(host, "https://")
+		host = strings.Trim(host, "/")
+		if host == "" {
+			continue
+		}
+		if parsed, err := url.Parse("https://" + host); err == nil && parsed.Host != "" {
+			host = strings.ToLower(parsed.Host)
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	return out
+}
+
+func marshalStreamHosts(hosts []string) (string, error) {
+	normalized := normalizeStreamHosts(hosts)
+	if normalized == nil {
+		normalized = []string{}
+	}
+	data, err := json.Marshal(normalized)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func unmarshalStreamHosts(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	var hosts []string
+	if err := json.Unmarshal([]byte(raw), &hosts); err != nil {
+		return nil
+	}
+	return normalizeStreamHosts(hosts)
+}
+
+func addAllowedHost(allowed map[string]bool, raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+
+	candidate := raw
+	if !strings.Contains(candidate, "://") {
+		candidate = "https://" + candidate
+	}
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return
+	}
+
+	host := strings.ToLower(parsed.Host)
+	if host != "" {
+		allowed[host] = true
+	}
+	if hostname := strings.ToLower(parsed.Hostname()); hostname != "" {
+		allowed[hostname] = true
+	}
 }
