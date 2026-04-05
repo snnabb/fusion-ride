@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-fusionride
-fusionride-*
+/fusionride
+/fusionride-*
 deploy.go
 deploy.exe
 deploy_win.exe
