@@ -217,3 +217,145 @@ func TestIsAggregatablePathExcludesUsersMe(t *testing.T) {
 		t.Fatal("expected /emby/Items to remain aggregatable")
 	}
 }
+
+func TestHandleLoginTriesNextOnlineUpstream(t *testing.T) {
+	firstServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad credentials", http.StatusUnauthorized)
+	}))
+	defer firstServer.Close()
+
+	secondCalled := 0
+	secondServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondCalled++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"ServerId": "upstream-server",
+			"User": map[string]any{
+				"Id":   "upstream-user",
+				"Name": "demo",
+			},
+			"AccessToken": "client-token",
+		})
+	}))
+	defer secondServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-a')
+	`, 1, "emby-a", firstServer.URL)
+	if err != nil {
+		t.Fatalf("insert first upstream failed: %v", err)
+	}
+	_, err = database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-b')
+	`, 2, "emby-b", secondServer.URL)
+	if err != nil {
+		t.Fatalf("insert second upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	cfg := config.Default()
+	cfg.Server.ID = "fusionride"
+
+	handler := NewHandler(cfg, manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"demo","Pw":"secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected login to succeed against second upstream, got %d with body %s", rec.Code, rec.Body.String())
+	}
+	if secondCalled != 1 {
+		t.Fatalf("expected second upstream to be tried once, got %d", secondCalled)
+	}
+}
+
+func TestHandleLoginReturnsUnauthorizedWhenAllUpstreamsFail(t *testing.T) {
+	forbiddenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "denied", http.StatusForbidden)
+	}))
+	defer forbiddenServer.Close()
+
+	unauthorizedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad credentials", http.StatusUnauthorized)
+	}))
+	defer unauthorizedServer.Close()
+
+	database := openProxyTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-a')
+	`, 1, "emby-a", forbiddenServer.URL)
+	if err != nil {
+		t.Fatalf("insert first upstream failed: %v", err)
+	}
+	_, err = database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, '', 'web', 1, 'online', 'token-b')
+	`, 2, "emby-b", unauthorizedServer.URL)
+	if err != nil {
+		t.Fatalf("insert second upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	store := idmap.NewStore(database)
+	handler := NewHandler(config.Default(), manager, nil, store, logger.New(""), traffic.NewMeter(database))
+
+	req := httptest.NewRequest(http.MethodPost, "/emby/Users/AuthenticateByName", strings.NewReader(`{"Username":"demo","Pw":"secret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when all upstreams fail, got %d", rec.Code)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "所有上游均登录失败") {
+		t.Fatalf("expected Chinese aggregate login failure, got %q", body)
+	}
+}
+
+func TestSessionCleanupRemovesExpiredEntriesAndRefreshesAccess(t *testing.T) {
+	handler := &Handler{
+		sessionMaxAge:          24 * time.Hour,
+		sessionCleanupInterval: 10 * time.Minute,
+		sessions:               make(map[string]loginSession),
+	}
+
+	oldTime := time.Now().Add(-48 * time.Hour)
+	handler.sessions["expired-token"] = loginSession{
+		UpstreamID:     1,
+		UpstreamUserID: "user-old",
+		VirtualUserID:  "virtual-old",
+		lastAccess:     oldTime,
+	}
+	handler.sessions["fresh-token"] = loginSession{
+		UpstreamID:     1,
+		UpstreamUserID: "user-fresh",
+		VirtualUserID:  "virtual-fresh",
+		lastAccess:     oldTime,
+	}
+
+	session, ok := handler.lookupSession("fresh-token")
+	if !ok {
+		t.Fatal("expected fresh token lookup to succeed")
+	}
+	if session.lastAccess.Before(oldTime) {
+		t.Fatalf("expected lookup to refresh lastAccess, got %s", session.lastAccess)
+	}
+
+	removed := handler.cleanupExpiredSessions(time.Now())
+	if removed != 1 {
+		t.Fatalf("expected one expired session to be removed, got %d", removed)
+	}
+	if _, ok := handler.lookupSession("expired-token"); ok {
+		t.Fatal("expected expired token to be removed")
+	}
+	if _, ok := handler.lookupSession("fresh-token"); !ok {
+		t.Fatal("expected fresh token to remain after cleanup")
+	}
+}

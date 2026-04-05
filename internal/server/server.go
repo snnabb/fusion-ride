@@ -59,6 +59,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cfg.Bitrate.CodecPriority,
 	)
 	proxyHandler := proxy.NewHandler(s.cfg, s.upMgr, agg, ids, s.log, s.meter)
+	proxyHandler.StartSessionCleanup(ctx)
 
 	s.adminAPI = admin.NewAPI(s.cfg, s.cfgPath, adminAuth, s.upMgr, ids, s.log, s.meter)
 	s.adminAPI.StartTrafficBroadcast(s.meter, 2*time.Second)

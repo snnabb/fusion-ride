@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/snnabb/fusion-ride/internal/auth"
 	"github.com/snnabb/fusion-ride/internal/db"
 	"github.com/snnabb/fusion-ride/internal/idmap"
 	"github.com/snnabb/fusion-ride/internal/logger"
@@ -129,5 +130,134 @@ func TestAggregateItemsRespectsCancellation(t *testing.T) {
 	}
 	if time.Since(start) > 200*time.Millisecond {
 		t.Fatalf("expected AggregateItems to stop quickly after cancellation, took %s", time.Since(start))
+	}
+}
+
+func TestAggregateSingleItemUsesSessionUserID(t *testing.T) {
+	var capturedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id": "item-1",
+		})
+	}))
+	defer server.Close()
+
+	database := openAggregatorTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'infuse', 1, 'online', 'token')
+	`, 1, "emby-a", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	selected := manager.ByID(1)
+	selected.Mu.Lock()
+	selected.Session = &auth.UpstreamSession{
+		ServerID: 1,
+		Token:    "token",
+		UserID:   "user-123",
+	}
+	selected.Mu.Unlock()
+
+	store := idmap.NewStore(database)
+	virtualID := store.GetOrCreate("item-1", 1, "Movie")
+	agg := New(manager, store, logger.New(""), time.Second, nil)
+
+	if _, err := agg.AggregateSingleItem(context.Background(), virtualID); err != nil {
+		t.Fatalf("AggregateSingleItem failed: %v", err)
+	}
+
+	if capturedPath != "/Users/user-123/Items/item-1" {
+		t.Fatalf("expected AggregateSingleItem to use session user ID path, got %q", capturedPath)
+	}
+}
+
+func TestAggregateSingleItemFallsBackWhenSessionUserIDMissing(t *testing.T) {
+	var capturedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.RequestURI()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id": "item-1",
+		})
+	}))
+	defer server.Close()
+
+	database := openAggregatorTestDB(t)
+	_, err := database.Exec(`
+		INSERT INTO upstreams(id, name, url, playback_mode, spoof_mode, enabled, health_status, session_token)
+		VALUES(?, ?, ?, 'proxy', 'infuse', 1, 'online', 'token')
+	`, 1, "emby-a", server.URL)
+	if err != nil {
+		t.Fatalf("insert upstream failed: %v", err)
+	}
+
+	manager := upstream.NewManager(database, logger.New(""), "proxy")
+	selected := manager.ByID(1)
+	selected.Mu.Lock()
+	selected.Session = &auth.UpstreamSession{
+		ServerID: 1,
+		Token:    "token",
+	}
+	selected.Mu.Unlock()
+
+	store := idmap.NewStore(database)
+	virtualID := store.GetOrCreate("item-1", 1, "Movie")
+	agg := New(manager, store, logger.New(""), time.Second, nil)
+
+	if _, err := agg.AggregateSingleItem(context.Background(), virtualID); err != nil {
+		t.Fatalf("AggregateSingleItem failed: %v", err)
+	}
+
+	if capturedPath != "/Items/item-1?Fields=MediaSources,ProviderIds" {
+		t.Fatalf("expected AggregateSingleItem fallback path, got %q", capturedPath)
+	}
+}
+
+func TestVirtualizeItemUsesStructuredJSONWalk(t *testing.T) {
+	store := idmap.NewStore(openAggregatorTestDB(t))
+	agg := &Aggregator{
+		idStore: store,
+		log:     logger.New(""),
+	}
+
+	expectedID := store.GetOrCreate("item-1", 1, "Movie")
+	expectedSeriesID := store.GetOrCreate("series-1", 1, "")
+	expectedParentID := store.GetOrCreate("parent-1", 1, "")
+
+	item := EmbyItem{
+		ID:       "item-1",
+		Type:     "Movie",
+		ServerID: 1,
+		Raw: json.RawMessage(`{
+			"Id":"item-1",
+			"SeriesId":"series-1",
+			"ParentId":"parent-1",
+			"Name":"Movie item-1",
+			"Overview":"literal item-1 should stay"
+		}`),
+	}
+
+	virtualized := agg.virtualizeItem(item)
+	var parsed map[string]any
+	if err := json.Unmarshal(virtualized, &parsed); err != nil {
+		t.Fatalf("unmarshal virtualized item failed: %v", err)
+	}
+
+	if got := parsed["Id"]; got != expectedID {
+		t.Fatalf("expected Id %q, got %v", expectedID, got)
+	}
+	if got := parsed["SeriesId"]; got != expectedSeriesID {
+		t.Fatalf("expected SeriesId %q, got %v", expectedSeriesID, got)
+	}
+	if got := parsed["ParentId"]; got != expectedParentID {
+		t.Fatalf("expected ParentId %q, got %v", expectedParentID, got)
+	}
+	if got := parsed["Overview"]; got != "literal item-1 should stay" {
+		t.Fatalf("expected Overview string to stay unchanged, got %v", got)
 	}
 }

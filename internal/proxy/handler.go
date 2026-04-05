@@ -28,19 +28,24 @@ type Handler struct {
 	log   *logger.Logger
 	meter *traffic.Meter
 
-	sessionMu sync.RWMutex
-	sessions  map[string]loginSession
+	sessionMu              sync.RWMutex
+	sessions               map[string]loginSession
+	sessionMaxAge          time.Duration
+	sessionCleanupInterval time.Duration
+	cleanupOnce            sync.Once
 }
 
 func NewHandler(cfg *config.Config, upMgr *upstream.Manager, agg *aggregator.Aggregator, ids *idmap.Store, log *logger.Logger, meter *traffic.Meter) *Handler {
 	return &Handler{
-		cfg:      cfg,
-		upMgr:    upMgr,
-		agg:      agg,
-		ids:      ids,
-		log:      log,
-		meter:    meter,
-		sessions: make(map[string]loginSession),
+		cfg:                    cfg,
+		upMgr:                  upMgr,
+		agg:                    agg,
+		ids:                    ids,
+		log:                    log,
+		meter:                  meter,
+		sessions:               make(map[string]loginSession),
+		sessionMaxAge:          24 * time.Hour,
+		sessionCleanupInterval: 10 * time.Minute,
 	}
 }
 
@@ -48,6 +53,49 @@ type loginSession struct {
 	UpstreamID     int
 	UpstreamUserID string
 	VirtualUserID  string
+	lastAccess     time.Time
+}
+
+func (h *Handler) StartSessionCleanup(ctx context.Context) {
+	if h.sessionCleanupInterval <= 0 || h.sessionMaxAge <= 0 {
+		return
+	}
+
+	h.cleanupOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(h.sessionCleanupInterval)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if removed := h.cleanupExpiredSessions(time.Now()); removed > 0 {
+						h.log.Debug("已清理 %d 个过期登录会话", removed)
+					}
+				}
+			}
+		}()
+	})
+}
+
+func (h *Handler) cleanupExpiredSessions(now time.Time) int {
+	if h.sessionMaxAge <= 0 {
+		return 0
+	}
+
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+
+	removed := 0
+	for token, session := range h.sessions {
+		if session.lastAccess.IsZero() || now.Sub(session.lastAccess) > h.sessionMaxAge {
+			delete(h.sessions, token)
+			removed++
+		}
+	}
+	return removed
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -115,18 +163,44 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := h.withTimeout(r.Context(), h.cfg.Timeouts.Login)
 	defer cancel()
 
-	selected := onlineUpstreams[0]
-	resp, err := selected.DoAPIWithHeaders(ctx, http.MethodPost, "/Users/AuthenticateByName", bytes.NewReader(body), r.Header)
-	if err != nil {
-		http.Error(w, "登录失败："+err.Error(), http.StatusUnauthorized)
-		return
-	}
-	defer resp.Body.Close()
+	var (
+		selected *upstream.Upstream
+		respBody []byte
+		lastErr  error
+	)
 
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(respBody)
+	for _, candidate := range onlineUpstreams {
+		resp, err := candidate.DoAPIWithHeaders(ctx, http.MethodPost, "/Users/AuthenticateByName", bytes.NewReader(body), r.Header)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		candidateBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("读取上游 [%s] 登录响应失败: %w", candidate.Name, readErr)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			selected = candidate
+			respBody = candidateBody
+			break
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			lastErr = fmt.Errorf("上游 [%s] 用户名或密码错误", candidate.Name)
+			continue
+		}
+
+		lastErr = fmt.Errorf("上游 [%s] 返回 HTTP %d", candidate.Name, resp.StatusCode)
+	}
+
+	if selected == nil {
+		if lastErr != nil {
+			h.log.Warn("用户 [%s] 登录失败: %v", loginReq.Username, lastErr)
+		}
+		http.Error(w, "所有上游均登录失败", http.StatusUnauthorized)
 		return
 	}
 
@@ -152,7 +226,12 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	modified, _ := json.Marshal(result)
+	modified, err := json.Marshal(result)
+	if err != nil {
+		http.Error(w, "重写登录响应失败", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(modified)
 
@@ -513,16 +592,32 @@ func (h *Handler) handleFallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) rememberSession(token string, session loginSession) {
+	if token == "" {
+		return
+	}
+
+	session.lastAccess = time.Now()
+
 	h.sessionMu.Lock()
 	defer h.sessionMu.Unlock()
 	h.sessions[token] = session
 }
 
 func (h *Handler) lookupSession(token string) (loginSession, bool) {
-	h.sessionMu.RLock()
-	defer h.sessionMu.RUnlock()
+	if token == "" {
+		return loginSession{}, false
+	}
+
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+
 	session, ok := h.sessions[token]
-	return session, ok
+	if !ok {
+		return loginSession{}, false
+	}
+	session.lastAccess = time.Now()
+	h.sessions[token] = session
+	return session, true
 }
 
 func (h *Handler) withTimeout(parent context.Context, timeoutMS int) (context.Context, context.CancelFunc) {

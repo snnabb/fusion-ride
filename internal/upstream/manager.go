@@ -116,7 +116,7 @@ func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoof
 		name, url, username, password, apiKey, playbackMode, spoofMode,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("淇濆瓨涓婃父澶辫触: %w", err)
+		return 0, fmt.Errorf("保存上游失败: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
@@ -139,7 +139,7 @@ func (m *Manager) Add(name, url, username, password, apiKey, playbackMode, spoof
 	m.upstreams = append(m.upstreams, u)
 	m.mu.Unlock()
 
-	m.log.Info("宸叉坊鍔犱笂娓?[%s] %s", name, url)
+	m.log.Info("已添加上游 [%s] %s", name, url)
 
 	go m.authenticate(u)
 
@@ -158,7 +158,7 @@ func (m *Manager) Remove(id int) error {
 		}
 	}
 	if idx == -1 {
-		return fmt.Errorf("?? %d ???", id)
+		return fmt.Errorf("上游 %d 不存在", id)
 	}
 
 	name := m.upstreams[idx].Name
@@ -168,14 +168,14 @@ func (m *Manager) Remove(id int) error {
 	}
 
 	m.upstreams = append(m.upstreams[:idx], m.upstreams[idx+1:]...)
-	m.log.Info("宸茬Щ闄や笂娓?[%s]", name)
+	m.log.Info("已删除上游 [%s]", name)
 	return nil
 }
 
 func (m *Manager) Update(id int, fields map[string]any) error {
 	u := m.ByID(id)
 	if u == nil {
-		return fmt.Errorf("?? %d ???", id)
+		return fmt.Errorf("上游 %d 不存在", id)
 	}
 
 	setClauses := make([]string, 0, len(fields))
@@ -186,41 +186,41 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 		case "name", "username", "password", "api_key", "streaming_url":
 			value, ok := v.(string)
 			if !ok {
-				return fmt.Errorf("?? %d ??? %s ?????", id, k)
+				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, k)
 			}
 			normalized[k] = value
 		case "url":
 			value, ok := v.(string)
 			if !ok {
-				return fmt.Errorf("?? %d ? URL ?????", id)
+				return fmt.Errorf("上游 %d 的 URL 类型错误", id)
 			}
 			normalized[k] = strings.TrimRight(value, "/")
 		case "playback_mode":
 			value, ok := v.(string)
 			if !ok {
-				return fmt.Errorf("?? %d ??????????", id)
+				return fmt.Errorf("上游 %d 的播放模式类型错误", id)
 			}
 			normalized[k] = normalizePlaybackMode(value)
 		case "spoof_mode":
 			value, ok := v.(string)
 			if !ok {
-				return fmt.Errorf("?? %d ? UA ?????????", id)
+				return fmt.Errorf("上游 %d 的 UA 伪装模式类型错误", id)
 			}
 			normalized[k] = identity.NormalizeMode(value)
 		case "enabled", "priority_meta", "follow_redirects":
 			value, ok := v.(bool)
 			if !ok {
-				return fmt.Errorf("?? %d ??? %s ?????", id, k)
+				return fmt.Errorf("上游 %d 的字段 %s 类型错误", id, k)
 			}
 			normalized[k] = value
 		case "priority":
 			value, ok := v.(int)
 			if !ok {
-				return fmt.Errorf("?? %d ?????????", id)
+				return fmt.Errorf("上游 %d 的优先级类型错误", id)
 			}
 			normalized[k] = value
 		default:
-			return fmt.Errorf("??????? %s", k)
+			return fmt.Errorf("不支持的字段 %s", k)
 		}
 	}
 	for k, v := range normalized {
@@ -286,7 +286,7 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 	if shouldReconnect {
 		u.Session = nil
 		u.HealthStatus = "unknown"
-		u.HealthMessage = "??????"
+		u.HealthMessage = "等待重新连接"
 	}
 	enabled := u.Enabled
 	u.Mu.Unlock()
@@ -301,7 +301,7 @@ func (m *Manager) Update(id int, fields map[string]any) error {
 func (m *Manager) Reconnect(id int) error {
 	u := m.ByID(id)
 	if u == nil {
-		return fmt.Errorf("?? %d ???", id)
+		return fmt.Errorf("上游 %d 不存在", id)
 	}
 	go m.authenticate(u)
 	return nil
@@ -376,7 +376,7 @@ func (m *Manager) loadFromDB() {
 		        enabled, health_status, session_token
 		 FROM upstreams ORDER BY priority ASC`)
 	if err != nil {
-		m.log.Error("鍔犺浇涓婃父鍒楄〃澶辫触: %v", err)
+		m.log.Error("加载上游列表失败: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -394,7 +394,7 @@ func (m *Manager) loadFromDB() {
 			&u.Enabled, &u.HealthStatus, &sessionToken,
 		)
 		if err != nil {
-			m.log.Error("璇诲彇涓婃父璁板綍澶辫触: %v", err)
+			m.log.Error("读取上游记录失败: %v", err)
 			continue
 		}
 
@@ -414,7 +414,7 @@ func (m *Manager) loadFromDB() {
 		}
 
 		m.upstreams = append(m.upstreams, &u)
-		m.log.Info("????? [%s] %s????%s?", u.Name, u.URL, u.HealthStatus)
+		m.log.Info("已加载上游 [%s] %s，状态：%s", u.Name, u.URL, u.HealthStatus)
 	}
 }
 
@@ -427,14 +427,14 @@ func (m *Manager) authenticate(u *Upstream) {
 	headers := u.Spoofer.Headers()
 	u.Mu.Unlock()
 
-	m.log.Info("姝ｅ湪璁よ瘉涓婃父 [%s]", u.Name)
+	m.log.Info("正在认证上游 [%s]", u.Name)
 
 	session, err := auth.AuthenticateUpstream(
 		baseURL, username, password, apiKey, headers,
 		10*time.Second,
 	)
 	if err != nil {
-		m.log.Error("涓婃父 [%s] 璁よ瘉澶辫触: %v", u.Name, err)
+		m.log.Error("上游 [%s] 认证失败: %v", u.Name, err)
 		u.Mu.Lock()
 		u.HealthStatus = "offline"
 		u.HealthMessage = err.Error()
@@ -446,13 +446,13 @@ func (m *Manager) authenticate(u *Upstream) {
 	u.Mu.Lock()
 	u.Session = session
 	u.HealthStatus = "online"
-	u.HealthMessage = "璁よ瘉鎴愬姛"
+	u.HealthMessage = "认证成功"
 	u.Mu.Unlock()
 
 	m.db.Exec(`UPDATE upstreams SET session_token = ?, health_status = 'online' WHERE id = ?`,
 		session.Token, u.ID)
 
-	m.log.Info("涓婃父 [%s] 璁よ瘉鎴愬姛", u.Name)
+	m.log.Info("上游 [%s] 认证成功", u.Name)
 }
 
 func (m *Manager) checkAllHealth(timeout time.Duration) {
@@ -489,12 +489,12 @@ func (m *Manager) checkAllHealth(timeout time.Duration) {
 
 			if prevStatus != newStatus {
 				if newStatus == "online" {
-					m.log.Info("?? [%s] ??????? -> ???%s", u.Name, msg)
+					m.log.Info("健康检查 [%s] 状态变更：在线，%s", u.Name, msg)
 					if u.Session == nil {
 						go m.authenticate(u)
 					}
 				} else {
-					m.log.Warn("?? [%s] ??????? -> ???%s", u.Name, msg)
+					m.log.Warn("健康检查 [%s] 状态变更：离线，%s", u.Name, msg)
 				}
 			}
 
@@ -514,7 +514,7 @@ func (u *Upstream) DoAPI(ctx context.Context, method, path string, body io.Reade
 	u.Mu.RUnlock()
 
 	if session == nil {
-		return nil, fmt.Errorf("涓婃父 [%s] 灏氭湭璁よ瘉", u.Name)
+		return nil, fmt.Errorf("上游 [%s] 尚未认证", u.Name)
 	}
 
 	if ctx == nil {
@@ -544,7 +544,7 @@ func (u *Upstream) DoAPIWithHeaders(ctx context.Context, method, path string, bo
 	u.Mu.RUnlock()
 
 	if session == nil {
-		return nil, fmt.Errorf("娑撳﹥鐖?[%s] 鐏忔碍婀拋銈堢槈", u.Name)
+		return nil, fmt.Errorf("上游 [%s] 尚未认证", u.Name)
 	}
 	if spoofer == nil {
 		spoofer = identity.NewSpoofer("infuse", "", "", "", "", "")
@@ -592,7 +592,7 @@ func (u *Upstream) DoAPIJSON(ctx context.Context, method, path string, body io.R
 
 	if resp.StatusCode != 200 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("涓婃父杩斿洖 HTTP %d: %s", resp.StatusCode, string(b))
+		return fmt.Errorf("上游返回 HTTP %d: %s", resp.StatusCode, string(b))
 	}
 
 	return json.NewDecoder(resp.Body).Decode(result)
@@ -652,6 +652,15 @@ func (u *Upstream) EffectivePlaybackMode(globalMode string) string {
 		return u.PlaybackMode
 	}
 	return globalMode
+}
+
+func (u *Upstream) GetUserID() string {
+	u.Mu.RLock()
+	defer u.Mu.RUnlock()
+	if u.Session == nil {
+		return ""
+	}
+	return u.Session.UserID
 }
 
 func (u *Upstream) BuildStreamURL(originalID string, query string) string {

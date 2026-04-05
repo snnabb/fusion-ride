@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -60,11 +61,11 @@ func New(upMgr *upstream.Manager, idStore *idmap.Store, log *logger.Logger, time
 	}
 
 	return &Aggregator{
-		upMgr:          upMgr,
-		idStore:        idStore,
-		log:            log,
-		timeout:        timeout,
-		codecPriority:  priority,
+		upMgr:         upMgr,
+		idStore:       idStore,
+		log:           log,
+		timeout:       timeout,
+		codecPriority: priority,
 	}
 }
 
@@ -237,7 +238,17 @@ func (a *Aggregator) AggregateSingleItem(ctx context.Context, virtualID string) 
 	ctx, cancel := a.aggregateContext(ctx)
 	defer cancel()
 
-	resp, err := selected.DoAPI(ctx, "GET", fmt.Sprintf("/Users/{uid}/Items/%s", originalID), nil)
+	userID := selected.GetUserID()
+
+	var (
+		resp *http.Response
+		err  error
+	)
+	if userID == "" {
+		resp, err = selected.DoAPI(ctx, "GET", fmt.Sprintf("/Items/%s?Fields=MediaSources,ProviderIds", originalID), nil)
+	} else {
+		resp, err = selected.DoAPI(ctx, "GET", fmt.Sprintf("/Users/%s/Items/%s", userID, originalID), nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -295,10 +306,10 @@ func (a *Aggregator) parseItems(data []byte, serverID int) []EmbyItem {
 
 func (a *Aggregator) parseOneItem(raw json.RawMessage, serverID int) EmbyItem {
 	var parsed struct {
-		ID          string            `json:"Id"`
-		Name        string            `json:"Name"`
-		Type        string            `json:"Type"`
-		ProviderIDs map[string]string `json:"ProviderIds"`
+		ID           string            `json:"Id"`
+		Name         string            `json:"Name"`
+		Type         string            `json:"Type"`
+		ProviderIDs  map[string]string `json:"ProviderIds"`
 		MediaSources []struct {
 			ID           string `json:"Id"`
 			Bitrate      int    `json:"Bitrate"`
@@ -448,39 +459,49 @@ func (a *Aggregator) sortMediaSources(sources []MediaSource) {
 }
 
 func (a *Aggregator) virtualizeItem(item EmbyItem) json.RawMessage {
-	virtualID := a.idStore.GetOrCreate(item.ID, item.ServerID, item.Type)
-	item.VirtualID = virtualID
-	return json.RawMessage(strings.ReplaceAll(string(item.Raw), `"`+item.ID+`"`, `"`+virtualID+`"`))
+	var parsed any
+	if err := json.Unmarshal(item.Raw, &parsed); err != nil {
+		return item.Raw
+	}
+
+	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId"}, item.ServerID, a.idStore)
+
+	result, err := json.Marshal(parsed)
+	if err != nil {
+		return item.Raw
+	}
+	return json.RawMessage(result)
 }
 
 func (a *Aggregator) virtualizeRawItem(raw json.RawMessage, serverID int) json.RawMessage {
-	var parsed struct {
-		ID string `json:"Id"`
-	}
-	_ = json.Unmarshal(raw, &parsed)
-	if parsed.ID == "" {
+	var parsed any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return raw
 	}
 
-	virtualID := a.idStore.GetOrCreate(parsed.ID, serverID, "")
-	return json.RawMessage(strings.ReplaceAll(string(raw), `"`+parsed.ID+`"`, `"`+virtualID+`"`))
+	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId"}, serverID, a.idStore)
+
+	result, err := json.Marshal(parsed)
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(result)
 }
 
 func (a *Aggregator) virtualizeRawBytes(data []byte, serverID int) []byte {
-	var parsed map[string]any
+	var parsed any
 	if json.Unmarshal(data, &parsed) != nil {
 		return data
 	}
 
-	result := string(data)
-	for _, originalID := range extractIDs(parsed) {
-		virtualID := a.idStore.GetOrCreate(originalID, serverID, "")
-		if virtualID != originalID {
-			result = strings.ReplaceAll(result, `"`+originalID+`"`, `"`+virtualID+`"`)
-		}
+	walkAndVirtualize(parsed, []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId", "ChannelId"}, serverID, a.idStore)
+
+	result, err := json.Marshal(parsed)
+	if err != nil {
+		return data
 	}
 
-	return []byte(result)
+	return result
 }
 
 func (a *Aggregator) mergeMediaSources(ctx context.Context, mainBody []byte, instances []idmap.Instance, mainServerID int) []byte {
@@ -540,13 +561,20 @@ func maxBitrate(sources []MediaSource) int {
 	return max
 }
 
-func extractIDs(data map[string]any) []string {
-	keys := []string{"Id", "SeriesId", "SeasonId", "ParentId", "AlbumId"}
-	var ids []string
-	for _, key := range keys {
-		if value, ok := data[key].(string); ok && value != "" {
-			ids = append(ids, value)
+func walkAndVirtualize(data any, idFields []string, serverID int, store *idmap.Store) {
+	switch v := data.(type) {
+	case map[string]any:
+		for _, field := range idFields {
+			if id, ok := v[field].(string); ok && id != "" {
+				v[field] = store.GetOrCreate(id, serverID, "")
+			}
+		}
+		for _, value := range v {
+			walkAndVirtualize(value, idFields, serverID, store)
+		}
+	case []any:
+		for _, value := range v {
+			walkAndVirtualize(value, idFields, serverID, store)
 		}
 	}
-	return ids
 }
